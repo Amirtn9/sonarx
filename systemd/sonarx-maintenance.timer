@@ -1,0 +1,12 @@
+[Unit]
+Description=Run SonarX order recovery and service synchronization periodically
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+RandomizedDelaySec=45
+Persistent=true
+Unit=sonarx-maintenance.service
+
+[Install]
+WantedBy=timers.target

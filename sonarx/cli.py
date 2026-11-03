@@ -34,7 +34,7 @@ def validate_token(token):
 def main():
     p=argparse.ArgumentParser(prog='sonarx',description='SonarX administration CLI')
     s=p.add_subparsers(dest='cmd',required=True)
-    for cmd in ['status','users','orders','admins','settings','db-upgrade','db-current','start','stop','restart','update','service-install','service-remove','doctor']:
+    for cmd in ['status','users','orders','admins','settings','db-upgrade','db-current','start','stop','restart','update','service-install','service-remove','doctor','sync-services','recover-orders']:
         s.add_parser(cmd)
     lg=s.add_parser('logs');lg.add_argument('-n','--lines',type=int,default=150);lg.add_argument('-f','--follow',action='store_true')
     b=s.add_parser('backup');b.add_argument('--output')
@@ -64,14 +64,56 @@ def main():
             run(['pg_restore','--clean','--if-exists',*common,'-d',u.database or '',x.file],env=env)
     elif x.cmd=='logs':run(['journalctl','-u','sonarx','-n',str(x.lines),'-f' if x.follow else '--no-pager'])
     elif x.cmd in {'start','stop','restart','service-install','service-remove'}:
-        if x.cmd=='service-install':run(['systemctl','daemon-reload']);run(['systemctl','enable','--now','sonarx'])
+        if x.cmd=='service-install':run(['systemctl','daemon-reload']);run(['systemctl','enable','--now','sonarx']);run(['systemctl','enable','--now','sonarx-maintenance.timer'])
         elif x.cmd=='service-remove':
-            run(['systemctl','disable','--now','sonarx'],check=False);Path('/etc/systemd/system/sonarx.service').unlink(missing_ok=True);Path('/usr/local/bin/sonarx').unlink(missing_ok=True);run(['systemctl','daemon-reload']);print('Service removed; database preserved.')
+            run(['systemctl','disable','--now','sonarx'],check=False)
+            run(['systemctl','disable','--now','sonarx-maintenance.timer'],check=False)
+            for unit in ('sonarx.service','sonarx-maintenance.service','sonarx-maintenance.timer'):
+                Path('/etc/systemd/system/'+unit).unlink(missing_ok=True)
+            Path('/usr/local/bin/sonarx').unlink(missing_ok=True)
+            run(['systemctl','daemon-reload']);print('Services removed; application data and database preserved.')
         else:run(['systemctl',x.cmd,'sonarx'])
     elif x.cmd=='update':
         if not (ROOT/'.git').exists():raise SystemExit('No Git checkout at /opt/sonarx')
-        run(['systemctl','stop','sonarx'],check=False);run(['git','-C',str(ROOT),'pull','--ff-only'])
-        run([str(ROOT/'.venv/bin/pip'),'install','-r',str(ROOT/'requirements.txt')]);run([str(ROOT/'.venv/bin/alembic'),'upgrade','head']);run(['systemctl','restart','sonarx'])
+        old= subprocess.check_output(['git','-C',str(ROOT),'rev-parse','HEAD'],text=True).strip()
+        run(['systemctl','stop','sonarx'],check=False)
+        try:
+            backup_dir=Path('/var/backups/sonarx');backup_dir.mkdir(parents=True,exist_ok=True);os.chmod(backup_dir,0o700)
+            backup_file=backup_dir/f"pre-update-{datetime.now().strftime('%Y%m%d-%H%M%S')}.dump"
+            if os.getenv('DATABASE_URL','').startswith(('postgresql://','postgresql+psycopg://','postgres://')):
+                run([sys.executable,'-m','sonarx.cli','backup','--output',str(backup_file)])
+            else:
+                sqlite_path=Path(os.getenv('DATABASE_PATH','data/sonarx.sqlite3'))
+                if sqlite_path.exists():
+                    import shutil
+                    shutil.copy2(sqlite_path,backup_file.with_suffix('.sqlite3'))
+            run(['git','-C',str(ROOT),'pull','--ff-only'])
+            run([str(ROOT/'.venv/bin/pip'),'install','-r',str(ROOT/'requirements.txt')])
+            run([str(ROOT/'.venv/bin/alembic'),'upgrade','head'])
+        except Exception:
+            print('Update failed. Restoring previous source revision and dependencies…',file=sys.stderr)
+            run(['git','-C',str(ROOT),'reset','--hard',old],check=False)
+            run([str(ROOT/'.venv/bin/pip'),'install','-r',str(ROOT/'requirements.txt')],check=False)
+            raise
+        finally:
+            run(['systemctl','restart','sonarx'],check=False)
+    elif x.cmd=='recover-orders':
+        d=database()
+        from .workers.order_recovery import recover_stale_orders
+        report=recover_stale_orders(d,int(os.getenv('ORDER_RECOVERY_MINUTES','15')))
+        for oid in report['order_ids']:
+            print('Moved to review:',oid)
+        print('Recovery:',report)
+        d.close()
+    elif x.cmd=='sync-services':
+        d=database()
+        from .config import settings
+        from .security import SecretBox
+        from .workers.service_sync import sync_services
+        box=SecretBox(settings.fernet_key) if settings.fernet_key else None
+        report=sync_services(d,box,limit=int(os.getenv('SERVICE_SYNC_BATCH','500')),verify_tls=settings.verify_tls)
+        print(json.dumps(report,ensure_ascii=False,indent=2))
+        d.close()
     elif x.cmd=='status':
         d=database();print('Database:',d.backend);print(d.stats());d.close();run(['systemctl','is-active','sonarx'],check=False)
     elif x.cmd=='doctor':
@@ -116,7 +158,7 @@ def main():
         if x.action=='get':
             if not x.key:raise SystemExit('config get KEY')
             val=vals.get(x.key)
-            if any(k in x.key for k in ('TOKEN','PASSWORD','KEY','SECRET')):val='[REDACTED]' if val else '(unset)'
+            if any(k in x.key for k in ('TOKEN','PASSWORD','KEY','SECRET','DATABASE_URL','DSN','URI')):val='[REDACTED]' if val else '(unset)'
             print(val if val is not None else '(unset)')
         elif x.action=='set':
             allowed={'TIMEZONE','CURRENCY_LABEL','SUPPORT_USERNAME','PASARGUARD_VERIFY_TLS','DB_POOL_SIZE'}
@@ -126,7 +168,7 @@ def main():
             run(['systemctl','restart','sonarx'])
         else:
             for k,v in vals.items():
-                if any(secret in k for secret in ('TOKEN','PASSWORD','KEY','SECRET')) and v:v='[REDACTED]'
+                if any(secret in k for secret in ('TOKEN','PASSWORD','KEY','SECRET','DATABASE_URL','DSN','URI')) and v:v='[REDACTED]'
                 print(f'{k}={v or ""}')
     elif x.cmd=='user-credit':
         d=database();d.add_credit(x.user_id,x.amount,x.ref or f'cli:{x.user_id}:{datetime.now().timestamp()}');d.close();print('Balance updated')

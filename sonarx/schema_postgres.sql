@@ -1,6 +1,6 @@
-CREATE TABLE IF NOT EXISTS users(id BIGINT PRIMARY KEY, username TEXT, first_name TEXT, balance BIGINT NOT NULL DEFAULT 0 CHECK(balance>=0), is_blocked INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS users(id BIGINT PRIMARY KEY, username TEXT, first_name TEXT, balance BIGINT NOT NULL DEFAULT 0 CHECK(balance>=0), is_blocked INTEGER NOT NULL DEFAULT 0, phone TEXT, phone_verified INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS servers(id BIGSERIAL PRIMARY KEY,name TEXT UNIQUE NOT NULL,url TEXT NOT NULL,username TEXT NOT NULL,password_enc TEXT NOT NULL,panel_type TEXT NOT NULL DEFAULT 'pasarguard',active INTEGER NOT NULL DEFAULT 1,priority INTEGER NOT NULL DEFAULT 100,created_at TEXT NOT NULL DEFAULT '');
-CREATE TABLE IF NOT EXISTS products(id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,description TEXT DEFAULT '',price BIGINT NOT NULL CHECK(price>=0),traffic_gb BIGINT NOT NULL CHECK(traffic_gb>=0),days INTEGER NOT NULL CHECK(days>=0),group_ids TEXT DEFAULT '[]',active INTEGER NOT NULL DEFAULT 1,sort_order INTEGER NOT NULL DEFAULT 100);
+CREATE TABLE IF NOT EXISTS products(id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,description TEXT DEFAULT '',price BIGINT NOT NULL CHECK(price>=0),traffic_gb BIGINT NOT NULL CHECK(traffic_gb>=0),days INTEGER NOT NULL CHECK(days>=0),group_ids TEXT DEFAULT '[]',active INTEGER NOT NULL DEFAULT 1,sort_order INTEGER NOT NULL DEFAULT 100,category_id BIGINT,is_trial INTEGER NOT NULL DEFAULT 0,is_custom INTEGER NOT NULL DEFAULT 0,custom_owner_id BIGINT);
 CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES users(id),product_id BIGINT NOT NULL REFERENCES products(id),amount BIGINT NOT NULL,status TEXT NOT NULL,server_id BIGINT REFERENCES servers(id),remote_username TEXT,subscription_url TEXT,error TEXT,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS services(id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES users(id),order_id TEXT UNIQUE NOT NULL REFERENCES orders(id),product_id BIGINT NOT NULL REFERENCES products(id),server_id BIGINT NOT NULL REFERENCES servers(id),remote_username TEXT NOT NULL,subscription_url TEXT,data_limit_bytes BIGINT NOT NULL DEFAULT 0,used_bytes BIGINT NOT NULL DEFAULT 0,expires_at TEXT,status TEXT NOT NULL DEFAULT 'active',created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS deposits(id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES users(id),amount BIGINT NOT NULL CHECK(amount>0),receipt_id TEXT NOT NULL UNIQUE,status TEXT NOT NULL DEFAULT 'pending',created_at TEXT NOT NULL,reviewed_at TEXT,reviewed_by BIGINT);
@@ -30,3 +30,9 @@ CREATE TABLE IF NOT EXISTS lottery_entries(id BIGSERIAL PRIMARY KEY,user_id BIGI
 CREATE TABLE IF NOT EXISTS bot_buttons(btn_key TEXT PRIMARY KEY,label TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,sort_order INTEGER NOT NULL DEFAULT 100);
 CREATE INDEX IF NOT EXISTS idx_gift_redemptions_user ON gift_redemptions(user_id,created_at);
 CREATE INDEX IF NOT EXISTS idx_resellers_active ON resellers(active);
+
+CREATE TABLE IF NOT EXISTS wheel_spins(id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES users(id),roll_value INTEGER,reward BIGINT NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS reseller_requests(id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES users(id),description TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',created_at TEXT NOT NULL,reviewed_at TEXT,reviewed_by BIGINT);
+CREATE INDEX IF NOT EXISTS idx_products_category ON products(category_id,active);
+CREATE INDEX IF NOT EXISTS idx_wheel_user ON wheel_spins(user_id,created_at);
+CREATE INDEX IF NOT EXISTS idx_reseller_requests_status ON reseller_requests(status,created_at);

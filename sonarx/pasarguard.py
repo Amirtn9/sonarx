@@ -153,6 +153,10 @@ class MarzbanClient(PasarGuardClient):
 
 class MarzneshinClient(PasarGuardClient):
     """Secondary adapter for Marzneshin; group_ids are interpreted as service_ids."""
+    def get_user(self,username):
+        self.ensure_login()
+        return self._request('GET',f'/api/users/{quote(username,safe="")}')
+
     def login(self):
         data=self._request('POST','/api/admins/token',data={'username':self.username,'password':self.password},headers={'Content-Type':'application/x-www-form-urlencoded'})
         token=data.get('access_token')

@@ -143,6 +143,8 @@ install_app(){
   chown -R sonarx:sonarx data logs
   chmod 640 .env
   install -m 0644 systemd/sonarx.service /etc/systemd/system/sonarx.service
+  install -m 0644 systemd/sonarx-maintenance.service /etc/systemd/system/sonarx-maintenance.service
+  install -m 0644 systemd/sonarx-maintenance.timer /etc/systemd/system/sonarx-maintenance.timer
   cat >/usr/local/bin/sonarx <<'WRAPPER'
 #!/usr/bin/env bash
 cd /opt/sonarx
@@ -159,19 +161,45 @@ WRAPPER
   rm -f .migration-needed
   systemctl daemon-reload
   systemctl enable --now "$SERVICE"
+  systemctl enable --now sonarx-maintenance.timer
   ok "SonarX installed. Run: sonarx status"
   info "Admin commands: sonarx token-change | sonarx admins-set ID1,ID2 | sonarx logs -n 200 -f"
 }
 update_app(){
   need_root
   [[ -d "$APP_DIR/.git" ]] || { fail "SonarX is not installed."; exit 1; }
+  local old_head
+  old_head="$(git -C "$APP_DIR" rev-parse HEAD)"
   systemctl stop "$SERVICE" || true
-  git -C "$APP_DIR" fetch origin "$BRANCH"
-  git -C "$APP_DIR" pull --ff-only origin "$BRANCH"
-  cd "$APP_DIR"
-  .venv/bin/pip install -r requirements.txt
-  .venv/bin/alembic upgrade head
+  mkdir -p /var/backups/sonarx
+  chmod 700 /var/backups/sonarx
+  if [[ "$(get_env DATABASE_URL)" == postgresql* ]]; then
+    if ! /usr/local/bin/sonarx backup --output "/var/backups/sonarx/pre-update-$(date +%Y%m%d-%H%M%S).dump"; then
+      systemctl restart "$SERVICE" || true
+      fail "Pre-update database backup failed; update cancelled."
+      return 1
+    fi
+  elif [[ -n "$(get_env DATABASE_PATH)" && -f "$APP_DIR/$(get_env DATABASE_PATH)" ]]; then
+    if ! cp "$APP_DIR/$(get_env DATABASE_PATH)" "/var/backups/sonarx/pre-update-$(date +%Y%m%d-%H%M%S).sqlite3"; then
+      systemctl restart "$SERVICE" || true
+      fail "SQLite backup failed; update cancelled."
+      return 1
+    fi
+  fi
+  if ! { git -C "$APP_DIR" fetch origin "$BRANCH" &&
+         git -C "$APP_DIR" pull --ff-only origin "$BRANCH" &&
+         cd "$APP_DIR" &&
+         .venv/bin/pip install -r requirements.txt &&
+         .venv/bin/alembic upgrade head; }; then
+    warn "Update failed; restoring previous source revision."
+    git -C "$APP_DIR" reset --hard "$old_head" || true
+    (cd "$APP_DIR" && .venv/bin/pip install -r requirements.txt) || true
+    systemctl restart "$SERVICE" || true
+    fail "Update did not complete. Check /var/log/sonarx-install.log and database migration state."
+    return 1
+  fi
   systemctl restart "$SERVICE"
+  systemctl enable --now sonarx-maintenance.timer
   ok "SonarX updated."
 }
 remove_app(){
@@ -180,7 +208,8 @@ remove_app(){
   prompt answer "Remove application files? Type REMOVE to confirm: "
   [[ "$answer" == "REMOVE" ]] || { info "Cancelled."; return; }
   systemctl disable --now "$SERVICE" || true
-  rm -f /etc/systemd/system/sonarx.service /usr/local/bin/sonarx
+  systemctl disable --now sonarx-maintenance.timer || true
+  rm -f /etc/systemd/system/sonarx.service /etc/systemd/system/sonarx-maintenance.service /etc/systemd/system/sonarx-maintenance.timer /usr/local/bin/sonarx
   systemctl daemon-reload
   rm -rf "$APP_DIR"
   ok "Application removed; database preserved."

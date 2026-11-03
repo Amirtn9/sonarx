@@ -1,15 +1,49 @@
-# SonarX 6.0 — Telegram VPN Store
+# SonarX — Project Index
+
+**Start here:** [Project Map](PROJECT_MAP.md) · [Sitemap](SITEMAP.md) · [Docs Index](docs/README_FA.md) · [WizWiz Feature Parity](docs/WIZWIZ_PARITY_FA.md)
+
+```text
+SonarX/
+├── sonarx/       # Telegram bot, database, panels, CLI and workers
+│   ├── handlers/ # Telegram handler modules
+│   ├── services/ # Business workflows
+│   ├── repositories/ # Data access modules
+│   ├── panels/   # VPN panel adapters
+│   └── workers/  # Background jobs
+├── migrations/   # PostgreSQL/Alembic migrations
+├── tests/        # Unit and regression tests
+├── scripts/      # Migration and maintenance tools
+├── systemd/      # Bot service and maintenance timer
+├── docs/         # Architecture, operations, security and parity docs
+├── install.sh    # Install / update / remove
+└── PROJECT_MAP.md
+```
+
+# SonarX 6.2.0 — Telegram VPN Store
 
 SonarX is an independent Telegram VPN sales and administration bot. The admin information architecture is based on the supplied feature screenshots and Mirza Bot reference, while keeping SonarX branding and implementation independent. **PasarGuard is the primary panel adapter**; Marzban and Marzneshin are secondary adapters.
 
 ## Customer features
-- Persistent Telegram Reply Keyboard for navigation plus Inline Keyboards for in-message actions.
+- Two-column Inline Keyboard dashboard for navigation and dedicated detail screens.
+- Mutually exclusive keyboard modes: Inline for navigation; Telegram Reply Keyboard only for text entry, final confirmation, deposit approve/reject, refund confirmation, custom-link deletion, back/cancel and ticket closure. The active Inline menu is cleared before Reply mode, and Reply mode is removed before the next Inline screen.
+- The `/start` command clears legacy persistent Reply keyboards from earlier versions.
 - Plan catalogue, wallet purchase, PasarGuard provisioning and subscription delivery.
 - Manual receipt-based wallet deposits with one-time admin approval.
 - Service/order history, support tickets, FAQ and tutorials.
-- Gift wallet-credit codes, percentage discounts during checkout, referral links and dice rewards (feature switches control availability).
+- Gift wallet-credit codes, percentage discounts during checkout, referral links and cooldown-based dice/slot prize wheel.
+- Category-aware product catalogue and product/category assignment.
+- Quota-limited free trial accounts and custom plans priced per GB/per day.
+- Subscription QR codes and manual service refresh from the connected panel.
+- Telegram contact verification, optional Iran-number validation and required-channel membership gate.
+- Purchase/deposit cashback, reseller commissions, reseller applications and reseller dashboard.
 
-Telegram accepts only one `reply_markup` per message. SonarX therefore uses the persistent Reply Keyboard on the welcome/navigation message and Inline Keyboards in subsequent feature screens rather than attempting to attach both markup types to the same message.
+Telegram accepts only one `reply_markup` per message. SonarX also switches modes across screens: before a Reply Keyboard prompt, the active Inline menu is removed; after the prompt, the Reply Keyboard is removed before an Inline screen is rendered.
+
+## UI/UX structure
+- Customer dashboard with account balance, service list/detail, plan detail and help center.
+- Admin console split into eight focused sections instead of one long button list.
+- Main navigation edits the current screen when possible; each submenu has a clear return path.
+- Purchase and service add-on operations show a price preview and use a Reply Keyboard for explicit final confirmation. Deposit approval/rejection and uncertain-order refunds also require a separate native-keyboard confirmation step.
 
 ## Admin console
 - Sales/user/deposit/ticket dashboard and reports.
@@ -52,3 +86,8 @@ sonarx restore /root/sonarx-backup.dump --yes
 ```
 
 Do not commit `.env`, panel passwords, Fernet keys, backups or user data. Rotate any bot token that has been exposed in a shared file. The GitHub repository must be updated with this release before the one-line install URL points to it; this environment does not push commits to GitHub.
+
+
+## 6.2.0 — Mirza core parity
+
+This release ports core Mirza-style flows into SonarX's Python architecture: categorized products, quota-limited free trials, custom plans, QR subscriptions, manual service refresh, Telegram contact verification, required-channel membership, cashback/referral/reseller commissions, reseller requests and dashboard, and cooldown-based prize wheel. See `FEATURE_MATRIX_FA.md` for the explicit implementation boundary and remaining integrations.

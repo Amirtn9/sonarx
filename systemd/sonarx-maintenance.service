@@ -1,0 +1,19 @@
+[Unit]
+Description=SonarX maintenance (order recovery and panel snapshot sync)
+After=network-online.target postgresql.service sonarx.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=sonarx
+Group=sonarx
+WorkingDirectory=/opt/sonarx
+EnvironmentFile=/opt/sonarx/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/local/bin/sonarx recover-orders
+ExecStart=/usr/local/bin/sonarx sync-services
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/sonarx/data /opt/sonarx/logs
