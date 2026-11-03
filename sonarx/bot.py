@@ -4,6 +4,10 @@ from .config import settings
 from .db import Database
 from .security import SecretBox
 from .pasarguard import PasarGuardClient, MarzbanClient, MarzneshinClient, PasarGuardError
+from .guards import (
+    ROLE_PERMISSIONS, SECTION_PERMISSIONS, maintenance_enabled_for_user, is_blocked_user,
+    role_allows, admin_permission_for_callback, admin_permission_for_state
+)
 
 settings.validate()
 logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(name)s %(message)s')
@@ -15,10 +19,103 @@ states={}
 keyboard_modes={}  # Telegram Reply and Inline keyboards are mutually exclusive per chat.
 inline_message_ids={}  # All tracked Inline action messages per chat; cleared before Reply mode.
 
+def admin_role(uid):
+    if uid in settings.admin_ids:
+        return 'owner'
+    try:
+        return db.get_admin_role(uid)
+    except Exception:
+        return None
+
+
 def admin(uid):
-    if uid in settings.admin_ids:return True
-    try:return db.is_admin(uid)
-    except Exception:return False
+    return admin_role(uid) in ROLE_PERMISSIONS
+
+
+def can_admin(uid, permission):
+    return role_allows(admin_role(uid), permission)
+
+
+def maintenance(uid):
+    """Return True only when maintenance is enabled for a non-admin user."""
+    return maintenance_enabled_for_user(uid, feature, admin)
+
+
+def blocked(uid):
+    """Fail closed only for an explicitly blocked account; admins bypass user blocks."""
+    try:
+        if admin(uid):
+            return False
+        return is_blocked_user(db.get_user(uid), False)
+    except Exception:
+        log.exception('Could not evaluate blocked-user guard for uid=%s', uid)
+        return False
+
+
+# These guards are deliberately registered before feature handlers. The bot is a
+# private-chat product: never render account, wallet, ticket or subscription data
+# into a group/channel. Blocked users are stopped before any stateful handler runs.
+GUARDED_CONTENT_TYPES = [
+    'text', 'audio', 'document', 'photo', 'sticker', 'video', 'video_note',
+    'voice', 'contact', 'location', 'venue', 'animation', 'dice', 'web_app_data'
+]
+
+
+@bot.message_handler(func=lambda m: getattr(m.chat, 'type', None) != 'private',
+                     content_types=GUARDED_CONTENT_TYPES)
+def reject_non_private_message(m):
+    if getattr(m, 'from_user', None):
+        try:
+            bot.send_message(m.from_user.id, 'برای حفظ حریم خصوصی، SonarX فقط در گفتگوی خصوصی قابل استفاده است.')
+        except Exception:
+            pass
+
+
+@bot.callback_query_handler(func=lambda c: not getattr(c, 'message', None)
+                            or getattr(c.message.chat, 'type', None) != 'private')
+def reject_non_private_callback(c):
+    try:
+        bot.answer_callback_query(c.id, 'این عملیات فقط در گفتگوی خصوصی ربات قابل انجام است.', show_alert=True)
+    except Exception:
+        pass
+
+
+@bot.message_handler(func=lambda m: getattr(m.chat, 'type', None) == 'private'
+                     and getattr(m, 'from_user', None) is not None
+                     and blocked(m.from_user.id),
+                     content_types=GUARDED_CONTENT_TYPES)
+def reject_blocked_message(m):
+    bot.send_message(m.chat.id, 'دسترسی این حساب به ربات مسدود شده است. برای پیگیری با پشتیبانی تماس بگیرید.')
+
+
+@bot.callback_query_handler(func=lambda c: blocked(c.from_user.id))
+def reject_blocked_callback(c):
+    bot.answer_callback_query(c.id, 'دسترسی این حساب به ربات مسدود شده است.', show_alert=True)
+
+
+def insufficient_admin_callback(c):
+    permission = admin_permission_for_callback(c.data)
+    return permission is not None and not can_admin(c.from_user.id, permission)
+
+
+@bot.callback_query_handler(func=insufficient_admin_callback)
+def reject_admin_permission(c):
+    bot.answer_callback_query(c.id, 'نقش مدیریتی شما اجازه انجام این عملیات را ندارد.', show_alert=True)
+
+
+def insufficient_admin_state_message(m):
+    if not getattr(m, 'from_user', None):
+        return False
+    step = states.get(m.from_user.id, {}).get('step')
+    permission = admin_permission_for_state(step)
+    return permission is not None and not can_admin(m.from_user.id, permission)
+
+
+@bot.message_handler(func=insufficient_admin_state_message, content_types=['text'])
+def reject_admin_state_message(m):
+    states.pop(m.from_user.id, None)
+    bot.send_message(m.chat.id, 'مجوز نقش مدیریتی شما برای این عملیات کافی نیست؛ مرحله جاری لغو شد.')
+
 
 def safe(v):return str(v).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
 def fmt(v):return f'{int(v):,} {settings.currency_label}'
@@ -208,7 +305,7 @@ def finish_reply_mode(chat_id, uid, text, return_to='user_home'):
     states.pop(uid, None)
     remove_reply_keyboard(chat_id, text)
     if return_to.startswith('admin_section:') and admin(uid):
-        return admin_section_show(chat_id, return_to.split(':', 1)[1])
+        return admin_section_show(chat_id, return_to.split(':', 1)[1], uid=uid)
     return edit_or_send(chat_id, home_text(uid), home(uid))
 
 
@@ -323,7 +420,16 @@ ADMIN_SECTIONS = {
 }
 
 
-def admin_panel(chat_id, message_id=None):
+def admin_section_access(uid, section):
+    if uid is None:
+        return True
+    if section == 'system':
+        return any(can_admin(uid, permission) for permission in ('orders_review', 'settings', 'security'))
+    permission = SECTION_PERMISSIONS.get(section)
+    return bool(permission and can_admin(uid, permission))
+
+
+def admin_panel(chat_id, message_id=None, uid=None):
     if int(chat_id) <= 0:
         return None
     k = types.InlineKeyboardMarkup(row_width=2)
@@ -335,6 +441,8 @@ def admin_panel(chat_id, message_id=None):
         live, pending, reviews = {}, 0, 0
     buttons = []
     for key, (title, _desc, _items) in ADMIN_SECTIONS.items():
+        if not admin_section_access(uid, key):
+            continue
         if key == 'finance' and pending:
             title = f'💳 مالی و پرداخت · {pending}'
         elif key == 'support' and live.get('open_tickets'):
@@ -354,14 +462,21 @@ def admin_panel(chat_id, message_id=None):
     return edit_or_send(chat_id, text, k, message_id)
 
 
-def admin_section_show(chat_id, section, message_id=None):
+def admin_section_show(chat_id, section, message_id=None, uid=None):
     if int(chat_id) <= 0:
         return None
     if section not in ADMIN_SECTIONS:
-        return admin_panel(chat_id, message_id)
+        return admin_panel(chat_id, message_id, uid=uid)
+    if not admin_section_access(uid, section):
+        return edit_or_send(chat_id, 'نقش مدیریتی شما به این بخش دسترسی ندارد.', None, message_id)
     title, desc, items = ADMIN_SECTIONS[section]
     k = types.InlineKeyboardMarkup(row_width=2)
-    buttons = [types.InlineKeyboardButton(label, callback_data=callback) for label, callback in items]
+    visible_items = []
+    for label, callback in items:
+        permission = admin_permission_for_callback(callback)
+        if uid is None or (permission is not None and can_admin(uid, permission)):
+            visible_items.append((label, callback))
+    buttons = [types.InlineKeyboardButton(label, callback_data=callback) for label, callback in visible_items]
     for i in range(0, len(buttons), 2):
         k.row(*buttons[i:i+2])
     k.add(types.InlineKeyboardButton('⬅️ بازگشت به مرکز مدیریت', callback_data='admin'))
@@ -374,7 +489,7 @@ def admin_section(c):
     if not admin(c.from_user.id):
         return bot.answer_callback_query(c.id, 'دسترسی ندارید.', show_alert=True)
     section = c.data.split(':', 1)[1]
-    admin_section_show(c.message.chat.id, section, c.message.message_id)
+    admin_section_show(c.message.chat.id, section, c.message.message_id, uid=c.from_user.id)
     bot.answer_callback_query(c.id)
 
 
@@ -446,9 +561,9 @@ def special_reply_router(m):
         target = st.get('_return_to', 'user_home')
         remove_reply_keyboard(m.chat.id, 'عملیات لغو شد.' if action == REPLY_CANCEL else 'منوی اصلی')
         if action == REPLY_CANCEL and target.startswith('admin_section:') and admin(uid):
-            return admin_section_show(m.chat.id, target.split(':', 1)[1])
+            return admin_section_show(m.chat.id, target.split(':', 1)[1], uid=m.from_user.id)
         if action == REPLY_CANCEL and target == 'deposit_review' and admin(uid):
-            return admin_section_show(m.chat.id, 'finance')
+            return admin_section_show(m.chat.id, 'finance', uid=m.from_user.id)
         if action == REPLY_CANCEL and target == 'shop' and st.get('product_id'):
             return send_product_details(m.chat.id,st['product_id'],uid=m.from_user.id)
         return edit_or_send(m.chat.id, home_text(uid), home(uid))
@@ -457,7 +572,7 @@ def special_reply_router(m):
         target = st.get('_return_to', 'user_home')
         remove_reply_keyboard(m.chat.id, 'بازگشت به بخش قبلی')
         if target.startswith('admin_section:') and admin(uid):
-            return admin_section_show(m.chat.id, target.split(':', 1)[1])
+            return admin_section_show(m.chat.id, target.split(':', 1)[1], uid=m.from_user.id)
         if target == 'shop' and st.get('product_id'):
             return send_product_details(m.chat.id,st['product_id'],uid=m.from_user.id)
         if target == 'service_addon' and st.get('service_id'):
@@ -465,7 +580,7 @@ def special_reply_router(m):
         if target == 'deposit_review' and st.get('deposit_id'):
             return prompt_reply_mode(m.chat.id, uid, f'<b>🧾 تعیین تکلیف رسید #{st["deposit_id"]}</b>\nتأیید شارژ یا رد رسید را انتخاب کنید.', {'step':'review_deposit','deposit_id':st['deposit_id']}, rows=[(REPLY_APPROVE_DEPOSIT, REPLY_REJECT_DEPOSIT), (REPLY_BACK, REPLY_CANCEL)], return_to='admin_section:finance')
         if target == 'admin' and admin(uid):
-            return admin_panel(m.chat.id)
+            return admin_panel(m.chat.id, uid=m.from_user.id)
         return edit_or_send(m.chat.id, home_text(uid), home(uid))
     # A special key was pressed outside an active workflow; restore the dashboard.
     if action == REPLY_BACK:
@@ -539,7 +654,7 @@ def cancel(m):
     target = st.get('_return_to', 'user_home')
     remove_reply_keyboard(m.chat.id, 'عملیات لغو شد.')
     if target.startswith('admin_section:') and admin(m.from_user.id):
-        return admin_section_show(m.chat.id, target.split(':', 1)[1])
+        return admin_section_show(m.chat.id, target.split(':', 1)[1], uid=m.from_user.id)
     if target == 'shop' and st.get('product_id'):
         return send_product_details(m.chat.id,st['product_id'],uid=m.from_user.id)
     return edit_or_send(m.chat.id, home_text(m.from_user.id), home(m.from_user.id))
@@ -1293,7 +1408,7 @@ def ticket_body(m):
 def admin_entry(c):
     if not admin(c.from_user.id):
         return bot.answer_callback_query(c.id, 'دسترسی ندارید.', show_alert=True)
-    admin_panel(c.message.chat.id, c.message.message_id)
+    admin_panel(c.message.chat.id, c.message.message_id, uid=c.from_user.id)
     bot.answer_callback_query(c.id)
 
 @bot.callback_query_handler(func=lambda c: c.data == 'stats')
@@ -1749,7 +1864,7 @@ def review_refund(c):
 def admin_command(m):
     if admin(m.from_user.id):
         remove_reply_keyboard(m.chat.id, 'ورود به مرکز مدیریت')
-        admin_panel(m.chat.id)
+        admin_panel(m.chat.id, uid=m.from_user.id)
 
 
 # ---------------- SonarX 6.1: focused UI and exclusive keyboard modes ----------------
@@ -1898,7 +2013,7 @@ def feature_toggle(c):
 def admin_shortcut(m):
     if admin(m.from_user.id):
         remove_reply_keyboard(m.chat.id, 'ورود به مرکز مدیریت')
-        admin_panel(m.chat.id)
+        admin_panel(m.chat.id, uid=m.from_user.id)
     else: bot.reply_to(m,'دسترسی ندارید.')
 
 @bot.message_handler(func=lambda m:states.get(m.from_user.id,{}).get('step')=='gift_redeem')

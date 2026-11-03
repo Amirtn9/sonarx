@@ -39,7 +39,7 @@ def main():
     lg=s.add_parser('logs');lg.add_argument('-n','--lines',type=int,default=150);lg.add_argument('-f','--follow',action='store_true')
     b=s.add_parser('backup');b.add_argument('--output')
     r=s.add_parser('restore');r.add_argument('file');r.add_argument('--yes',action='store_true')
-    a=s.add_parser('admin-add');a.add_argument('user_id',type=int);a.add_argument('--role',default='operator')
+    a=s.add_parser('admin-add');a.add_argument('user_id',type=int);a.add_argument('--role',choices=['owner','admin','operator','finance','support','marketing','viewer'],default='operator')
     a=s.add_parser('admin-remove');a.add_argument('user_id',type=int)
     c=s.add_parser('user-credit');c.add_argument('user_id',type=int);c.add_argument('amount',type=int);c.add_argument('--ref',default=None)
     u=s.add_parser('user-block');u.add_argument('user_id',type=int);u.add_argument('--unblock',action='store_true')

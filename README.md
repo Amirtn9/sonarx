@@ -1,6 +1,6 @@
 # SonarX — Project Index
 
-**Start here:** [Project Map](PROJECT_MAP.md) · [Sitemap](SITEMAP.md) · [Docs Index](docs/README_FA.md) · [WizWiz Feature Parity](docs/WIZWIZ_PARITY_FA.md)
+**Start here:** [Project Map](PROJECT_MAP.md) · [Sitemap](SITEMAP.md) · [Bugfix Audit (FA)](BUGFIX_AUDIT_FA.md) · [Docs Index](docs/README_FA.md) · [WizWiz Feature Parity](docs/WIZWIZ_PARITY_FA.md)
 
 ```text
 SonarX/
@@ -19,7 +19,7 @@ SonarX/
 └── PROJECT_MAP.md
 ```
 
-# SonarX 6.2.0 — Telegram VPN Store
+# SonarX 6.3.1 — Telegram VPN Store
 
 SonarX is an independent Telegram VPN sales and administration bot. The admin information architecture is based on the supplied feature screenshots and Mirza Bot reference, while keeping SonarX branding and implementation independent. **PasarGuard is the primary panel adapter**; Marzban and Marzneshin are secondary adapters.
 

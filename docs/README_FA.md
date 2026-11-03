@@ -1,6 +1,7 @@
 # مرکز مستندات SonarX
 
 - [نقشه کامل پروژه](../PROJECT_MAP.md)
+- [گزارش ممیزی و اصلاح باگ‌ها](../BUGFIX_AUDIT_FA.md)
 - [تطبیق قابلیت‌ها با WizWiz](WIZWIZ_PARITY_FA.md)
 - [راهنمای عملیات و CLI](OPERATIONS_FA.md)
 - [چک‌لیست امنیت](SECURITY_FA.md)

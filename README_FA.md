@@ -1,6 +1,6 @@
 # SonarX — فهرست و نقشه پروژه
 
-**شروع از اینجا:** [نقشه معماری](PROJECT_MAP.md) · [نقشه سایت](SITEMAP.md) · [فهرست مستندات](docs/README_FA.md) · [تطبیق قابلیت‌ها با WizWiz](docs/WIZWIZ_PARITY_FA.md)
+**شروع از اینجا:** [نقشه معماری](PROJECT_MAP.md) · [نقشه سایت](SITEMAP.md) · [ممیزی باگ‌ها 6.3.1](BUGFIX_AUDIT_FA.md) · [فهرست مستندات](docs/README_FA.md) · [تطبیق قابلیت‌ها با WizWiz](docs/WIZWIZ_PARITY_FA.md)
 
 ```text
 SonarX/
@@ -19,7 +19,7 @@ SonarX/
 └── PROJECT_MAP.md
 ```
 
-# SonarX 6.2.0 — فروشگاه VPN و مرکز مدیریت
+# SonarX 6.3.1 — فروشگاه VPN و مرکز مدیریت
 
 SonarX یک ربات مستقل فروش و مدیریت سرویس VPN است. طراحی پنل مدیریت با الهام از فهرست قابلیت‌های تصویری ارائه‌شده انجام شده و برند، ساختار و مسیر توسعه SonarX مستقل مانده است. **PasarGuard پنل اصلی و اولویت‌دار** است؛ Marzban و Marzneshin به‌عنوان پنل‌های ثانویه در دسترس‌اند.
 

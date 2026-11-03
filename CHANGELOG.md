@@ -1,3 +1,17 @@
+# SonarX — Changelog
+
+## 6.3.1 — Reliability and security fixes
+
+- Fixed the missing maintenance-mode guard that caused Telegram polling callbacks to fail with `NameError`.
+- Enforced private-chat-only handling before user/admin handlers; group callbacks are rejected without exposing account data.
+- Enforced blocked-user checks before stateful message and callback handlers, while preserving administrator access.
+- Implemented role-based admin permissions for owner/admin/operator/finance/support/marketing/viewer across callback actions and stateful admin workflows; filtered admin menus by role.
+- Made wheel-spin completion atomic so concurrent callbacks cannot finalize the same spin more than once; negative rewards are rejected.
+- Fixed panel synchronization so an explicit null/zero expiry clears stale local expiry, while a missing expiry field preserves the existing value.
+- Added one-time authentication refresh for Marzban and Marzneshin user creation after a rejected stale-token request.
+- Closed SQLite schema-initialization connections deterministically to prevent connection leaks.
+- Added regression coverage for guards, role permissions, panel token refresh and expiry synchronization; 51 tests pass.
+
 # SonarX 6.2.0 — Mirza Core Parity
 
 - Added category-aware product browsing and product-to-category assignment.

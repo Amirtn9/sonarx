@@ -88,16 +88,22 @@ class MirzaParityCoreTests(unittest.TestCase):
     def test_upgrade_adds_new_columns_to_existing_sqlite_schema(self):
         import sqlite3
         legacy_path=os.path.join(self.tmp.name,"legacy.sqlite3")
-        with sqlite3.connect(legacy_path) as conn:
+        conn=sqlite3.connect(legacy_path)
+        try:
             conn.executescript("""
                 CREATE TABLE users(id INTEGER PRIMARY KEY,username TEXT,first_name TEXT,balance INTEGER NOT NULL DEFAULT 0,is_blocked INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
                 CREATE TABLE products(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,description TEXT DEFAULT '',price INTEGER NOT NULL,traffic_gb INTEGER NOT NULL,days INTEGER NOT NULL,group_ids TEXT DEFAULT '[]',active INTEGER NOT NULL DEFAULT 1,sort_order INTEGER NOT NULL DEFAULT 100);
             """)
+        finally:
+            conn.close()
         upgraded=Database(legacy_path)
         upgraded.close()
-        with sqlite3.connect(legacy_path) as conn:
+        conn=sqlite3.connect(legacy_path)
+        try:
             user_columns={r[1] for r in conn.execute("PRAGMA table_info(users)")}
             product_columns={r[1] for r in conn.execute("PRAGMA table_info(products)")}
+        finally:
+            conn.close()
         self.assertIn("phone",user_columns)
         self.assertIn("phone_verified",user_columns)
         self.assertIn("category_id",product_columns)
@@ -108,6 +114,8 @@ class MirzaParityCoreTests(unittest.TestCase):
         spin=self.db.claim_wheel_spin(1101,24)
         self.assertIsNotNone(spin)
         self.assertIsNone(self.db.claim_wheel_spin(1101,24))
+        with self.assertRaises(ValueError):
+            self.db.finish_wheel_spin(spin,6,-1)
         self.assertTrue(self.db.finish_wheel_spin(spin,6,500))
         self.assertFalse(self.db.finish_wheel_spin(spin,6,500))
         self.assertEqual(self.db.get_user(1101)["balance"],500)

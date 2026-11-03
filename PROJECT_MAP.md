@@ -10,6 +10,7 @@ SonarX/
 ├── README_FA.md                 # راهنمای فارسی
 ├── PROJECT_MAP.md               # نقشه معماری و مسیر فایل‌ها
 ├── SITEMAP.md                   # نقشه ناوبری مستندات و ماژول‌ها
+├── BUGFIX_AUDIT_FA.md            # گزارش ممیزی و اصلاحات نسخه 6.3.1
 ├── docs/
 │   ├── README_FA.md             # فهرست مستندات
 │   ├── WIZWIZ_PARITY_FA.md      # تطبیق قابلیت‌ها با مرجع WizWiz
@@ -19,6 +20,7 @@ SonarX/
 │   ├── bot.py                   # ورودی سازگار تلگرام (فعلاً نگهداری شده)
 │   ├── cli.py                   # مدیریت CMD/CLI
 │   ├── config.py                # تنظیمات محیطی
+│   ├── guards.py                # گارد تعمیرات و مسدودسازی
 │   ├── db.py                    # لایه تراکنش و Repositoryهای فعلی
 │   ├── pasarguard.py            # Adapterهای PasarGuard/Marzban/Marzneshin
 │   ├── schema_postgres.sql      # مرجع ساختار PostgreSQL
@@ -30,7 +32,7 @@ SonarX/
 │   ├── workers/
 │   │   ├── order_recovery.py    # بازیابی سفارش‌های نیمه‌تمام
 │   │   └── service_sync.py      # همگام‌سازی مصرف و وضعیت سرویس
-│   └── auth/                    # مقصد کنترل دسترسی و سیاست‌های امنیتی
+│   └── auth/                    # محل تفکیک آتی احراز هویت و مجوزها
 ├── migrations/
 │   └── versions/                # مهاجرت‌های Alembic
 ├── tests/                       # تست‌های واحد و Regression

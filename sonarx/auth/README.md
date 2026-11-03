@@ -1,3 +1,3 @@
 # Authentication and access policy
 
-Target location for RBAC, private-chat policy, administrator permissions and user verification. Existing secret encryption remains in `sonarx/security.py`.
+RBAC policy and runtime guards currently live in `sonarx/guards.py` and are enforced by `sonarx/bot.py`. This package is the planned separation point for future authentication and per-resource authorization modules. Secret encryption remains in `sonarx/security.py`.

@@ -28,6 +28,20 @@ sonarx sync-services
 
 مقادیر محرمانه از خروجی `config show/get` ماسک می‌شوند.
 
+## نقش‌های مدیران
+
+مدیر اصلی که در `ADMIN_IDS` تعریف شده، نقش `owner` دارد. برای مدیران جانبی از حداقل سطح لازم استفاده کنید:
+
+```bash
+sonarx admin-add 123456789 --role operator
+sonarx admin-add 234567890 --role finance
+sonarx admin-add 345678901 --role support
+sonarx admin-add 456789012 --role marketing
+sonarx admin-add 567890123 --role viewer
+```
+
+نقش‌های معتبر: `owner`، `admin`، `operator`، `finance`، `support`، `marketing` و `viewer`. اجرای دوباره `admin-add` برای همان شناسه، نقش فعال آن مدیر را به‌روزرسانی می‌کند. حذف دسترسی با `sonarx admin-remove ID` انجام می‌شود.
+
 ## زمان‌بندی
 
 `sonarx-maintenance.timer` به‌صورت پیش‌فرض هر ۱۰ دقیقه:

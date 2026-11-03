@@ -28,6 +28,16 @@ class PasarGuardClient:
         self._token=token; self.session.headers['Authorization']=f'Bearer {token}'; return True
     def ensure_login(self):
         if not self._token:self.login()
+    def _post_with_auth_retry(self,path,payload):
+        """Retry a rejected POST once after refreshing a stale panel token."""
+        try:
+            return self._request('POST',path,json=payload)
+        except PasarGuardError as exc:
+            if '401' not in str(exc) or exc.uncertain:
+                raise
+            self._token=None
+            self.login()
+            return self._request('POST',path,json=payload)
     @staticmethod
     def _sub(data):
         sub=data.get('subscription_url') or data.get('subscription_link') or data.get('sub_url') or data.get('subscription') or data.get('links')
@@ -41,11 +51,7 @@ class PasarGuardClient:
                  'data_limit_reset_strategy':'no_reset','note':note}
         if group_ids:payload['group_ids']=group_ids
         try:
-            try: result=self._request('POST','/api/user',json=payload)
-            except PasarGuardError as exc:
-                if '401' in str(exc):
-                    self._token=None; self.login(); result=self._request('POST','/api/user',json=payload)
-                else:raise
+            result=self._post_with_auth_retry('/api/user',payload)
         except (requests.Timeout,requests.ConnectionError) as exc:
             # The panel may have committed the POST. Reconcile by username; never POST to another panel blindly.
             try: result=self._request('GET',f'/api/user/{quote(username,safe="")}')
@@ -140,7 +146,7 @@ class MarzbanClient(PasarGuardClient):
                  'expire':expiry,'data_limit':int(float(traffic_gb)*1024**3) if traffic_gb else 0,
                  'data_limit_reset_strategy':'no_reset'}
         try:
-            result=self._request('POST','/api/user',json=payload)
+            result=self._post_with_auth_retry('/api/user',payload)
         except (requests.Timeout,requests.ConnectionError) as exc:
             try:result=self._request('GET',f'/api/user/{quote(username,safe="")}')
             except Exception as check:raise PasarGuardError('نتیجه ساخت اکانت Marzban نامشخص است؛ بررسی دستی لازم است.',True) from check
@@ -168,7 +174,7 @@ class MarzneshinClient(PasarGuardClient):
         payload={'username':username,'data_limit':int(float(traffic_gb)*1024**3) if traffic_gb else 0,
                  'expire_date':datetime.fromtimestamp(expire,timezone.utc).isoformat() if expire else None,
                  'service_ids':group_ids or [1],'expire_strategy':'fixed_date'}
-        try:result=self._request('POST','/api/users',json=payload)
+        try:result=self._post_with_auth_retry('/api/users',payload)
         except (requests.Timeout,requests.ConnectionError) as exc:
             try:result=self._request('GET',f'/api/users/{quote(username,safe="")}')
             except Exception as check:raise PasarGuardError('نتیجه ساخت اکانت Marzneshin نامشخص است؛ بررسی دستی لازم است.',True) from check

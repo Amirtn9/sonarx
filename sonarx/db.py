@@ -6,6 +6,9 @@ from datetime import datetime, timezone, timedelta
 
 def now(): return datetime.now(timezone.utc).isoformat()
 
+
+UNSET = object()  # Distinguish 'do not update' from 'clear nullable field'.
+
 class Row(dict):
     def __getitem__(self, key):
         if isinstance(key, int): return tuple(self.values())[key]
@@ -71,54 +74,58 @@ class Database:
 
     def init(self):
         if self.backend=='postgresql': return # Alembic owns production schema.
-        with self.lock, sqlite3.connect(self.path) as c:
-            c.executescript('''
-            PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
-            CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,username TEXT,first_name TEXT,balance INTEGER NOT NULL DEFAULT 0 CHECK(balance>=0),is_blocked INTEGER NOT NULL DEFAULT 0,phone TEXT,phone_verified INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS servers(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE,url TEXT NOT NULL,username TEXT NOT NULL,password_enc TEXT NOT NULL,panel_type TEXT NOT NULL DEFAULT 'pasarguard',active INTEGER NOT NULL DEFAULT 1,priority INTEGER NOT NULL DEFAULT 100,created_at TEXT NOT NULL DEFAULT '');
-            CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,description TEXT DEFAULT '',price INTEGER NOT NULL CHECK(price>=0),traffic_gb INTEGER NOT NULL CHECK(traffic_gb>=0),days INTEGER NOT NULL CHECK(days>=0),group_ids TEXT DEFAULT '[]',active INTEGER NOT NULL DEFAULT 1,sort_order INTEGER NOT NULL DEFAULT 100,category_id INTEGER,is_trial INTEGER NOT NULL DEFAULT 0,is_custom INTEGER NOT NULL DEFAULT 0,custom_owner_id INTEGER);
-            CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY,user_id INTEGER NOT NULL,product_id INTEGER NOT NULL,amount INTEGER NOT NULL,status TEXT NOT NULL,server_id INTEGER,remote_username TEXT,subscription_url TEXT,error TEXT,created_at TEXT NOT NULL,FOREIGN KEY(user_id) REFERENCES users(id));
-            CREATE TABLE IF NOT EXISTS services(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,order_id TEXT UNIQUE NOT NULL,product_id INTEGER NOT NULL,server_id INTEGER NOT NULL,remote_username TEXT NOT NULL,subscription_url TEXT,data_limit_bytes INTEGER NOT NULL DEFAULT 0,used_bytes INTEGER NOT NULL DEFAULT 0,expires_at TEXT,status TEXT NOT NULL DEFAULT 'active',created_at TEXT NOT NULL,FOREIGN KEY(user_id) REFERENCES users(id));
-            CREATE TABLE IF NOT EXISTS deposits(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,amount INTEGER NOT NULL CHECK(amount>0),receipt_id TEXT NOT NULL UNIQUE,status TEXT NOT NULL DEFAULT 'pending',created_at TEXT NOT NULL,reviewed_at TEXT,reviewed_by INTEGER);
-            CREATE TABLE IF NOT EXISTS ledger(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,amount INTEGER NOT NULL,kind TEXT NOT NULL,ref TEXT NOT NULL UNIQUE,created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TEXT NOT NULL DEFAULT '');
-            CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,subject TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'open',created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS ticket_messages(id INTEGER PRIMARY KEY AUTOINCREMENT,ticket_id INTEGER NOT NULL,sender_id INTEGER NOT NULL,body TEXT NOT NULL,created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS admin_roles(user_id INTEGER PRIMARY KEY,role TEXT NOT NULL DEFAULT 'operator',active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS audit_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,actor_id INTEGER,action TEXT NOT NULL,target TEXT,details TEXT,created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,gateway TEXT NOT NULL,provider_ref TEXT UNIQUE,amount INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'pending',payload TEXT,created_at TEXT NOT NULL,paid_at TEXT);
-            CREATE TABLE IF NOT EXISTS service_events(id INTEGER PRIMARY KEY AUTOINCREMENT,service_id INTEGER,user_id INTEGER NOT NULL,event_type TEXT NOT NULL,payload TEXT,created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL UNIQUE,active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL DEFAULT '');
-            CREATE TABLE IF NOT EXISTS discount_codes(code TEXT PRIMARY KEY,percent INTEGER NOT NULL,usage_limit INTEGER NOT NULL DEFAULT 0,used_count INTEGER NOT NULL DEFAULT 0,active INTEGER NOT NULL DEFAULT 1,expires_at TEXT,created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS gift_codes(code TEXT PRIMARY KEY,amount INTEGER NOT NULL DEFAULT 0,days INTEGER NOT NULL DEFAULT 0,traffic_gb INTEGER NOT NULL DEFAULT 0,usage_limit INTEGER NOT NULL DEFAULT 1,used_count INTEGER NOT NULL DEFAULT 0,active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS gift_redemptions(id INTEGER PRIMARY KEY AUTOINCREMENT,code TEXT NOT NULL,user_id INTEGER NOT NULL,created_at TEXT NOT NULL,UNIQUE(code,user_id));
-            CREATE TABLE IF NOT EXISTS resellers(user_id INTEGER PRIMARY KEY,commission_percent INTEGER NOT NULL DEFAULT 0,active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL);\n            CREATE TABLE IF NOT EXISTS reseller_requests(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,description TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',created_at TEXT NOT NULL,reviewed_at TEXT,reviewed_by INTEGER);
-            CREATE TABLE IF NOT EXISTS referrals(inviter_id INTEGER NOT NULL,invitee_id INTEGER NOT NULL UNIQUE,bonus_amount INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS channel_settings(kind TEXT PRIMARY KEY,chat_id TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS lottery_entries(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL UNIQUE,created_at TEXT NOT NULL);\n            CREATE TABLE IF NOT EXISTS wheel_spins(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,roll_value INTEGER,reward INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS bot_buttons(btn_key TEXT PRIMARY KEY,label TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,sort_order INTEGER NOT NULL DEFAULT 100);
-            CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id,created_at);
-            CREATE INDEX IF NOT EXISTS idx_services_user ON services(user_id,status);
-            CREATE INDEX IF NOT EXISTS idx_deposits_status ON deposits(status);
-            CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
-            CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger(user_id,created_at);
-            ''')
-            # Upgrade databases created by older SonarX releases without deleting data.
-            # Additive compatibility migration for earlier SonarX SQLite files.
-            upgrades={
-                'users': {'is_blocked':'INTEGER NOT NULL DEFAULT 0','phone':'TEXT','phone_verified':'INTEGER NOT NULL DEFAULT 0'},
-                'servers': {'panel_type':"TEXT NOT NULL DEFAULT 'pasarguard'",'priority':'INTEGER NOT NULL DEFAULT 100','created_at':"TEXT NOT NULL DEFAULT ''"},
-                'products': {'active':'INTEGER NOT NULL DEFAULT 1','sort_order':'INTEGER NOT NULL DEFAULT 100','category_id':'INTEGER','is_trial':'INTEGER NOT NULL DEFAULT 0','is_custom':'INTEGER NOT NULL DEFAULT 0','custom_owner_id':'INTEGER'},
-                'deposits': {'reviewed_at':'TEXT','reviewed_by':'INTEGER'},
-                'settings': {'updated_at':"TEXT NOT NULL DEFAULT ''"},
-            }
-            for table, additions in upgrades.items():
-                present={r[1] for r in c.execute(f'PRAGMA table_info({table})')}
-                for column, definition in additions.items():
-                    if column not in present:c.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
-            c.execute('CREATE INDEX IF NOT EXISTS idx_products_category ON products(category_id,active)')
-            c.execute('CREATE INDEX IF NOT EXISTS idx_wheel_user ON wheel_spins(user_id,created_at)')
-            c.commit()
+        with self.lock:
+            c=sqlite3.connect(self.path)
+            try:
+                c.executescript('''
+                PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
+                CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,username TEXT,first_name TEXT,balance INTEGER NOT NULL DEFAULT 0 CHECK(balance>=0),is_blocked INTEGER NOT NULL DEFAULT 0,phone TEXT,phone_verified INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS servers(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE,url TEXT NOT NULL,username TEXT NOT NULL,password_enc TEXT NOT NULL,panel_type TEXT NOT NULL DEFAULT 'pasarguard',active INTEGER NOT NULL DEFAULT 1,priority INTEGER NOT NULL DEFAULT 100,created_at TEXT NOT NULL DEFAULT '');
+                CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,description TEXT DEFAULT '',price INTEGER NOT NULL CHECK(price>=0),traffic_gb INTEGER NOT NULL CHECK(traffic_gb>=0),days INTEGER NOT NULL CHECK(days>=0),group_ids TEXT DEFAULT '[]',active INTEGER NOT NULL DEFAULT 1,sort_order INTEGER NOT NULL DEFAULT 100,category_id INTEGER,is_trial INTEGER NOT NULL DEFAULT 0,is_custom INTEGER NOT NULL DEFAULT 0,custom_owner_id INTEGER);
+                CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY,user_id INTEGER NOT NULL,product_id INTEGER NOT NULL,amount INTEGER NOT NULL,status TEXT NOT NULL,server_id INTEGER,remote_username TEXT,subscription_url TEXT,error TEXT,created_at TEXT NOT NULL,FOREIGN KEY(user_id) REFERENCES users(id));
+                CREATE TABLE IF NOT EXISTS services(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,order_id TEXT UNIQUE NOT NULL,product_id INTEGER NOT NULL,server_id INTEGER NOT NULL,remote_username TEXT NOT NULL,subscription_url TEXT,data_limit_bytes INTEGER NOT NULL DEFAULT 0,used_bytes INTEGER NOT NULL DEFAULT 0,expires_at TEXT,status TEXT NOT NULL DEFAULT 'active',created_at TEXT NOT NULL,FOREIGN KEY(user_id) REFERENCES users(id));
+                CREATE TABLE IF NOT EXISTS deposits(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,amount INTEGER NOT NULL CHECK(amount>0),receipt_id TEXT NOT NULL UNIQUE,status TEXT NOT NULL DEFAULT 'pending',created_at TEXT NOT NULL,reviewed_at TEXT,reviewed_by INTEGER);
+                CREATE TABLE IF NOT EXISTS ledger(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,amount INTEGER NOT NULL,kind TEXT NOT NULL,ref TEXT NOT NULL UNIQUE,created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TEXT NOT NULL DEFAULT '');
+                CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,subject TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'open',created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS ticket_messages(id INTEGER PRIMARY KEY AUTOINCREMENT,ticket_id INTEGER NOT NULL,sender_id INTEGER NOT NULL,body TEXT NOT NULL,created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS admin_roles(user_id INTEGER PRIMARY KEY,role TEXT NOT NULL DEFAULT 'operator',active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS audit_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,actor_id INTEGER,action TEXT NOT NULL,target TEXT,details TEXT,created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,gateway TEXT NOT NULL,provider_ref TEXT UNIQUE,amount INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'pending',payload TEXT,created_at TEXT NOT NULL,paid_at TEXT);
+                CREATE TABLE IF NOT EXISTS service_events(id INTEGER PRIMARY KEY AUTOINCREMENT,service_id INTEGER,user_id INTEGER NOT NULL,event_type TEXT NOT NULL,payload TEXT,created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL UNIQUE,active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL DEFAULT '');
+                CREATE TABLE IF NOT EXISTS discount_codes(code TEXT PRIMARY KEY,percent INTEGER NOT NULL,usage_limit INTEGER NOT NULL DEFAULT 0,used_count INTEGER NOT NULL DEFAULT 0,active INTEGER NOT NULL DEFAULT 1,expires_at TEXT,created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS gift_codes(code TEXT PRIMARY KEY,amount INTEGER NOT NULL DEFAULT 0,days INTEGER NOT NULL DEFAULT 0,traffic_gb INTEGER NOT NULL DEFAULT 0,usage_limit INTEGER NOT NULL DEFAULT 1,used_count INTEGER NOT NULL DEFAULT 0,active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS gift_redemptions(id INTEGER PRIMARY KEY AUTOINCREMENT,code TEXT NOT NULL,user_id INTEGER NOT NULL,created_at TEXT NOT NULL,UNIQUE(code,user_id));
+                CREATE TABLE IF NOT EXISTS resellers(user_id INTEGER PRIMARY KEY,commission_percent INTEGER NOT NULL DEFAULT 0,active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL);\n            CREATE TABLE IF NOT EXISTS reseller_requests(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,description TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',created_at TEXT NOT NULL,reviewed_at TEXT,reviewed_by INTEGER);
+                CREATE TABLE IF NOT EXISTS referrals(inviter_id INTEGER NOT NULL,invitee_id INTEGER NOT NULL UNIQUE,bonus_amount INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS channel_settings(kind TEXT PRIMARY KEY,chat_id TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS lottery_entries(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL UNIQUE,created_at TEXT NOT NULL);\n            CREATE TABLE IF NOT EXISTS wheel_spins(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,roll_value INTEGER,reward INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS bot_buttons(btn_key TEXT PRIMARY KEY,label TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,sort_order INTEGER NOT NULL DEFAULT 100);
+                CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id,created_at);
+                CREATE INDEX IF NOT EXISTS idx_services_user ON services(user_id,status);
+                CREATE INDEX IF NOT EXISTS idx_deposits_status ON deposits(status);
+                CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
+                CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger(user_id,created_at);
+                ''')
+                # Upgrade databases created by older SonarX releases without deleting data.
+                # Additive compatibility migration for earlier SonarX SQLite files.
+                upgrades={
+                    'users': {'is_blocked':'INTEGER NOT NULL DEFAULT 0','phone':'TEXT','phone_verified':'INTEGER NOT NULL DEFAULT 0'},
+                    'servers': {'panel_type':"TEXT NOT NULL DEFAULT 'pasarguard'",'priority':'INTEGER NOT NULL DEFAULT 100','created_at':"TEXT NOT NULL DEFAULT ''"},
+                    'products': {'active':'INTEGER NOT NULL DEFAULT 1','sort_order':'INTEGER NOT NULL DEFAULT 100','category_id':'INTEGER','is_trial':'INTEGER NOT NULL DEFAULT 0','is_custom':'INTEGER NOT NULL DEFAULT 0','custom_owner_id':'INTEGER'},
+                    'deposits': {'reviewed_at':'TEXT','reviewed_by':'INTEGER'},
+                    'settings': {'updated_at':"TEXT NOT NULL DEFAULT ''"},
+                }
+                for table, additions in upgrades.items():
+                    present={r[1] for r in c.execute(f'PRAGMA table_info({table})')}
+                    for column, definition in additions.items():
+                        if column not in present:c.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
+                c.execute('CREATE INDEX IF NOT EXISTS idx_products_category ON products(category_id,active)')
+                c.execute('CREATE INDEX IF NOT EXISTS idx_wheel_user ON wheel_spins(user_id,created_at)')
+                c.commit()
+            finally:
+                c.close()
 
     def close(self):
         if self.pool: self.pool.close()
@@ -372,11 +379,18 @@ class Database:
         with self.tx() as c: return [dict(r) for r in c.execute('SELECT * FROM orders ORDER BY created_at DESC LIMIT ?',(min(max(int(limit),1),500),)).fetchall()]
     def set_user_blocked(self,uid,blocked):
         with self.tx() as c: return c.execute('UPDATE users SET is_blocked=? WHERE id=?',(int(blocked),uid)).rowcount==1
-    def is_admin(self,uid):
+    def get_admin_role(self,uid):
         with self.tx() as c:
-            r=c.execute('SELECT active FROM admin_roles WHERE user_id=?',(uid,)).fetchone(); return bool(r and r['active'])
+            r=c.execute('SELECT role,active FROM admin_roles WHERE user_id=?',(uid,)).fetchone()
+            return str(r['role']).strip().lower() if r and r['active'] else None
+    def is_admin(self,uid):
+        return self.get_admin_role(uid) is not None
     def add_admin(self,uid,role='operator'):
-        with self.tx() as c: c.execute('INSERT INTO admin_roles(user_id,role,active,created_at) VALUES(?,?,1,?) ON CONFLICT(user_id) DO UPDATE SET role=excluded.role,active=1',(uid,role,now()))
+        role=str(role or '').strip().lower()
+        if role not in {'owner','admin','operator','finance','support','marketing','viewer'}:
+            raise ValueError('نقش مدیر نامعتبر است.')
+        with self.tx() as c:
+            c.execute('INSERT INTO admin_roles(user_id,role,active,created_at) VALUES(?,?,1,?) ON CONFLICT(user_id) DO UPDATE SET role=excluded.role,active=1',(uid,role,now()))
     def remove_admin(self,uid):
         with self.tx() as c: c.execute('UPDATE admin_roles SET active=0 WHERE user_id=?',(uid,))
     def list_admins(self):
@@ -560,20 +574,28 @@ class Database:
             cur=c.execute('INSERT INTO wheel_spins(user_id,created_at) VALUES(?,?)',(uid,now()))
             return cur.lastrowid
     def finish_wheel_spin(self,spin_id,value,reward):
+        reward=int(reward)
+        if reward<0:raise ValueError('wheel reward cannot be negative')
         with self.tx() as c:
             row=c.execute('SELECT * FROM wheel_spins WHERE id=?',(spin_id,)).fetchone()
             if not row or row['roll_value'] is not None:return False
-            c.execute('UPDATE wheel_spins SET roll_value=?,reward=? WHERE id=?',(int(value),int(reward),spin_id))
-            if int(reward)>0:
-                c.execute('UPDATE users SET balance=balance+? WHERE id=?',(int(reward),row['user_id']))
-                c.execute('INSERT INTO ledger(user_id,amount,kind,ref,created_at) VALUES(?,?,?,?,?)',(row['user_id'],int(reward),'wheel_reward',f'wheel:{spin_id}',now()))
+            # Conditional update is the concurrency guard: only one callback can
+            # claim a spin, even when two PostgreSQL transactions read it together.
+            changed=c.execute(
+                'UPDATE wheel_spins SET roll_value=?,reward=? WHERE id=? AND roll_value IS NULL',
+                (int(value),reward,spin_id)
+            ).rowcount
+            if changed!=1:return False
+            if reward>0:
+                c.execute('UPDATE users SET balance=balance+? WHERE id=?',(reward,row['user_id']))
+                c.execute('INSERT INTO ledger(user_id,amount,kind,ref,created_at) VALUES(?,?,?,?,?)',(row['user_id'],reward,'wheel_reward',f'wheel:{spin_id}',now()))
             return True
-    def update_service_snapshot(self,service_id,uid,used_bytes=None,limit_bytes=None,expires_at=None,status=None,subscription_url=None):
+    def update_service_snapshot(self,service_id,uid,used_bytes=None,limit_bytes=None,expires_at=UNSET,status=None,subscription_url=None):
         with self.tx() as c:
             fields=[];values=[]
             if used_bytes is not None:fields.append('used_bytes=?');values.append(max(0,int(used_bytes)))
             if limit_bytes is not None:fields.append('data_limit_bytes=?');values.append(max(0,int(limit_bytes)))
-            if expires_at is not None:fields.append('expires_at=?');values.append(expires_at)
+            if expires_at is not UNSET:fields.append('expires_at=?');values.append(expires_at)
             if status is not None:fields.append('status=?');values.append(str(status))
             if subscription_url is not None:fields.append('subscription_url=?');values.append(str(subscription_url))
             if not fields:return False

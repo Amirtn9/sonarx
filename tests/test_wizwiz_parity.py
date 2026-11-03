@@ -73,6 +73,28 @@ class WizWizParityTests(unittest.TestCase):
         self.assertEqual(recovered["server_id"], server["id"])
         self.assertEqual(recovered["remote_username"], "recovery-user")
 
+    def test_service_sync_preserves_expiry_when_panel_omits_expiry_field(self):
+        self.db.add_credit(501, 2000, "seed-sync-missing-expiry")
+        oid = self.db.begin_order(501, self.db.product(1))
+        self.db.add_server("panel-missing-expiry", "https://panel.invalid", "admin", "encrypted")
+        server = self.db.servers()[0]
+        self.db.finish_order(oid, server["id"], "vpn502", "https://sub.invalid/vpn")
+        before = self.db.services_for(501)[0]["expires_at"]
+
+        class Box:
+            def decrypt(self, value): return "password"
+        class Client:
+            def get_user(self, username):
+                return {"used_traffic": 50, "data_limit": 10 * 1024**3,
+                        "status": "active", "subscription_url": "https://sub.invalid/vpn"}
+            @staticmethod
+            def _sub(data): return data.get("subscription_url")
+
+        report = sync_services(self.db, Box(), client_factory=lambda row, box: Client())
+        self.assertEqual(report["updated"], 1)
+        after = self.db.services_for(501)[0]["expires_at"]
+        self.assertEqual(after, before)
+
     def test_service_sync_updates_usage_and_expiry(self):
         self.db.add_credit(501, 2000, "seed-sync")
         oid = self.db.begin_order(501, self.db.product(1))
@@ -92,6 +114,7 @@ class WizWizParityTests(unittest.TestCase):
         service = self.db.services_for(501)[0]
         self.assertEqual(service["used_bytes"], 1234)
         self.assertEqual(service["data_limit_bytes"], 10 * 1024**3)
+        self.assertIsNone(service["expires_at"], "an explicit null expiry from the panel must clear a stale local expiry")
         self.assertEqual(service["subscription_url"], "https://sub.invalid/new")
 
 

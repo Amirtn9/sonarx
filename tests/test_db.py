@@ -19,6 +19,14 @@ class DatabaseTests(unittest.TestCase):
   self.db.set_setting('feature.shop_enabled','0');self.assertEqual(self.db.get_setting('feature.shop_enabled'),'0');self.db.add_admin(777,'operator');self.assertTrue(self.db.is_admin(777));self.db.remove_admin(777);self.assertFalse(self.db.is_admin(777));self.db.audit(101,'test','target','details')
  def test_ticket_lifecycle(self):
   tid=self.db.add_ticket(101,'help','message');self.assertEqual(len(self.db.open_tickets()),1);self.db.reply_ticket(tid,999,'reply');self.assertEqual(len(self.db.ticket_messages(tid)),2);self.db.close_ticket(tid);self.assertEqual(self.db.open_tickets(),[])
+ def test_admin_role_is_readable_and_validated(self):
+  self.db.add_admin(778,'finance')
+  self.assertEqual(self.db.get_admin_role(778),'finance')
+  self.assertTrue(self.db.is_admin(778))
+  with self.assertRaises(ValueError):self.db.add_admin(779,'superuser')
+  self.db.remove_admin(778)
+  self.assertIsNone(self.db.get_admin_role(778))
+
  def test_user_blocking(self):
   self.assertTrue(self.db.set_user_blocked(101,True));self.assertTrue(self.db.get_user(101)['is_blocked'])
  def test_admin_plan_controls_and_pending_deposits(self):

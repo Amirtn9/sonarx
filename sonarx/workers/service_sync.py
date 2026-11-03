@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..pasarguard import PasarGuardClient, MarzbanClient, MarzneshinClient
+from ..db import UNSET
 
 
 def _as_datetime(value: Any):
@@ -70,9 +71,24 @@ def sync_services(db, secret_box, limit: int = 500, client_factory=None, verify_
             if quota_value is None:
                 quota_value = row.get("data_limit_bytes", 0)
             quota = int(quota_value or 0)
-            expiry = _as_datetime(remote.get("expire") or remote.get("expire_date"))
+            expiry_keys = ("expire", "expire_date", "expires_at", "expiryTime")
+            expiry_entries = [(key, remote[key]) for key in expiry_keys if key in remote]
+            if not expiry_entries:
+                expiry = UNSET
+                expiry_for_status = row.get("expires_at")
+            else:
+                selected = next(((key, value) for key, value in expiry_entries
+                                 if value not in (None, "", 0, "0")), None)
+                if selected is None:
+                    expiry = None
+                else:
+                    expiry_key, raw_expiry = selected
+                    if expiry_key == "expiryTime":
+                        raw_expiry = float(raw_expiry) / 1000
+                    expiry = _as_datetime(raw_expiry)
+                expiry_for_status = expiry
             sub = client._sub(remote) if hasattr(client, "_sub") else None
-            status = _status(remote, expiry, used, quota)
+            status = _status(remote, expiry_for_status, used, quota)
             ok = db.update_service_snapshot(
                 row["id"], row["user_id"], used_bytes=used, limit_bytes=quota,
                 expires_at=expiry, status=status, subscription_url=sub

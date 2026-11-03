@@ -8,6 +8,7 @@
 - [راهنمای فارسی](README_FA.md)
 - [نقشه معماری و پوشه‌ها](PROJECT_MAP.md)
 - [تغییرات نسخه‌ها](CHANGELOG.md)
+- [گزارش ممیزی و اصلاح باگ‌ها](BUGFIX_AUDIT_FA.md)
 - [ماتریس قابلیت‌ها](FEATURE_MATRIX_FA.md)
 - [تطبیق قابلیت‌ها با WizWiz](docs/WIZWIZ_PARITY_FA.md)
 
@@ -27,12 +28,14 @@
 | `sonarx/db.py` | دیتابیس، تراکنش‌ها، کیف پول و سفارش |
 | `sonarx/pasarguard.py` | API پنل‌های پشتیبانی‌شده |
 | `sonarx/security.py` | رمزنگاری اسرار |
+| `sonarx/guards.py` | کنترل تعمیرات و مسدودسازی کاربر |
 | `sonarx/workers/` | بازیابی سفارش و همگام‌سازی سرویس |
 | `sonarx/services/` | محل توسعه منطق تجاری مستقل |
 | `sonarx/repositories/` | محل تفکیک لایه داده |
 | `sonarx/panels/` | محل انتقال Adapterهای پنل |
 | `sonarx/handlers/` | محل تفکیک Handlerهای تلگرام |
-| `sonarx/auth/` | محل توسعه RBAC و سیاست دسترسی |
+| `sonarx/guards.py` | سیاست اجرایی RBAC، تعمیرات و مسدودسازی |
+| `sonarx/auth/` | محل تفکیک آتی احراز هویت و مجوزهای مستقل |
 
 ## زیرساخت و کیفیت
 
