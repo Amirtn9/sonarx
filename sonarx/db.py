@@ -18,7 +18,7 @@ class PgCursor:
     def fetchall(self): return [Row(r) for r in self.cur.fetchall()]
 
 class PgConn:
-    ID_TABLES={'servers','products','orders','deposits','ledger','tickets','ticket_messages','audit_logs','payments','service_events'}
+    ID_TABLES={'servers','products','orders','deposits','ledger','tickets','ticket_messages','audit_logs','payments','service_events','categories','discount_codes','gift_codes','resellers','lottery_entries'}
     def __init__(self, conn): self.conn=conn
     def execute(self, sql, params=()):
         q=str(sql)
@@ -88,6 +88,15 @@ class Database:
             CREATE TABLE IF NOT EXISTS audit_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,actor_id INTEGER,action TEXT NOT NULL,target TEXT,details TEXT,created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,gateway TEXT NOT NULL,provider_ref TEXT UNIQUE,amount INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'pending',payload TEXT,created_at TEXT NOT NULL,paid_at TEXT);
             CREATE TABLE IF NOT EXISTS service_events(id INTEGER PRIMARY KEY AUTOINCREMENT,service_id INTEGER,user_id INTEGER NOT NULL,event_type TEXT NOT NULL,payload TEXT,created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL UNIQUE,active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL DEFAULT '');
+            CREATE TABLE IF NOT EXISTS discount_codes(code TEXT PRIMARY KEY,percent INTEGER NOT NULL,usage_limit INTEGER NOT NULL DEFAULT 0,used_count INTEGER NOT NULL DEFAULT 0,active INTEGER NOT NULL DEFAULT 1,expires_at TEXT,created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS gift_codes(code TEXT PRIMARY KEY,amount INTEGER NOT NULL DEFAULT 0,days INTEGER NOT NULL DEFAULT 0,traffic_gb INTEGER NOT NULL DEFAULT 0,usage_limit INTEGER NOT NULL DEFAULT 1,used_count INTEGER NOT NULL DEFAULT 0,active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS gift_redemptions(id INTEGER PRIMARY KEY AUTOINCREMENT,code TEXT NOT NULL,user_id INTEGER NOT NULL,created_at TEXT NOT NULL,UNIQUE(code,user_id));
+            CREATE TABLE IF NOT EXISTS resellers(user_id INTEGER PRIMARY KEY,commission_percent INTEGER NOT NULL DEFAULT 0,active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS referrals(inviter_id INTEGER NOT NULL,invitee_id INTEGER NOT NULL UNIQUE,bonus_amount INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS channel_settings(kind TEXT PRIMARY KEY,chat_id TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS lottery_entries(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL UNIQUE,created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS bot_buttons(btn_key TEXT PRIMARY KEY,label TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,sort_order INTEGER NOT NULL DEFAULT 100);
             CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id,created_at);
             CREATE INDEX IF NOT EXISTS idx_services_user ON services(user_id,status);
             CREATE INDEX IF NOT EXISTS idx_deposits_status ON deposits(status);
@@ -258,3 +267,136 @@ class Database:
         with self.tx() as c: c.execute("UPDATE tickets SET status='closed' WHERE id=?",(tid,))
     def users_for_broadcast(self):
         with self.tx() as c: return [r[0] for r in c.execute('SELECT id FROM users WHERE is_blocked=0').fetchall()]
+
+
+    # SonarX 6.0 extended store/admin data
+    def add_category(self,name):
+        with self.tx() as c: c.execute("INSERT INTO categories(name,created_at) VALUES(?,?)",(name,now()))
+    def categories(self):
+        with self.tx() as c: return [dict(r) for r in c.execute("SELECT * FROM categories ORDER BY id").fetchall()]
+    def delete_category(self,cid):
+        with self.tx() as c: return c.execute("DELETE FROM categories WHERE id=?",(cid,)).rowcount==1
+    def add_discount(self,code,percent,usage_limit=0):
+        with self.tx() as c: c.execute("INSERT INTO discount_codes(code,percent,usage_limit,created_at) VALUES(?,?,?,?)",(code.upper(),percent,usage_limit,now()))
+    def discounts(self):
+        with self.tx() as c: return [dict(r) for r in c.execute("SELECT * FROM discount_codes ORDER BY created_at DESC").fetchall()]
+    def toggle_discount(self,code,active):
+        with self.tx() as c: return c.execute("UPDATE discount_codes SET active=? WHERE code=?",(int(active),code.upper())).rowcount==1
+    def add_gift_code(self,code,amount=0,days=0,traffic_gb=0,usage_limit=1):
+        with self.tx() as c: c.execute("INSERT INTO gift_codes(code,amount,days,traffic_gb,usage_limit,created_at) VALUES(?,?,?,?,?,?)",(code.upper(),amount,days,traffic_gb,usage_limit,now()))
+    def gift_codes(self):
+        with self.tx() as c: return [dict(r) for r in c.execute("SELECT * FROM gift_codes ORDER BY created_at DESC").fetchall()]
+    def redeem_gift(self,code,uid):
+        with self.tx() as c:
+            q="SELECT * FROM gift_codes WHERE code=? AND active=1"+(" FOR UPDATE" if self.backend=="postgresql" else "")
+            g=c.execute(q,(code.upper(),)).fetchone()
+            if not g or (g["usage_limit"] and g["used_count"]>=g["usage_limit"]): return None
+            inserted=c.execute("INSERT INTO gift_redemptions(code,user_id,created_at) VALUES(?,?,?) ON CONFLICT(code,user_id) DO NOTHING",(code.upper(),uid,now()))
+            if inserted.rowcount != 1: return None
+            c.execute("UPDATE gift_codes SET used_count=used_count+1 WHERE code=?",(code.upper(),))
+            if g["amount"]>0:
+                c.execute("UPDATE users SET balance=balance+? WHERE id=?",(g["amount"],uid))
+                c.execute("INSERT INTO ledger(user_id,amount,kind,ref,created_at) VALUES(?,?,?,?,?)",(uid,g["amount"],"gift",f"gift:{code.upper()}:{uid}",now()))
+            return dict(g)
+    def set_reseller(self,uid,commission=0,active=True):
+        with self.tx() as c:
+            c.execute("INSERT INTO resellers(user_id,commission_percent,active,created_at) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET commission_percent=excluded.commission_percent,active=excluded.active",(uid,commission,int(active),now()))
+    def resellers(self):
+        with self.tx() as c: return [dict(r) for r in c.execute("SELECT * FROM resellers ORDER BY created_at DESC").fetchall()]
+    def save_channel(self,kind,chat_id):
+        with self.tx() as c: c.execute("INSERT INTO channel_settings(kind,chat_id) VALUES(?,?) ON CONFLICT(kind) DO UPDATE SET chat_id=excluded.chat_id",(kind,chat_id))
+    def channels(self):
+        with self.tx() as c: return [dict(r) for r in c.execute("SELECT * FROM channel_settings ORDER BY kind").fetchall()]
+    def join_lottery(self,uid):
+        with self.tx() as c:
+            c.execute("INSERT INTO lottery_entries(user_id,created_at) VALUES(?,?)",(uid,now()))
+    def lottery_count(self):
+        with self.tx() as c: return c.execute("SELECT COUNT(*) FROM lottery_entries").fetchone()[0]
+    def search_users(self,query,limit=25):
+        q=str(query).strip()
+        with self.tx() as c:
+            if q.isdigit(): rows=c.execute("SELECT * FROM users WHERE id=? LIMIT ?",(int(q),limit)).fetchall()
+            else: rows=c.execute("SELECT * FROM users WHERE username LIKE ? OR first_name LIKE ? ORDER BY created_at DESC LIMIT ?",(f"%{q}%",f"%{q}%",limit)).fetchall()
+            return [dict(r) for r in rows]
+    def top_users(self,limit=10):
+        with self.tx() as c: return [dict(r) for r in c.execute("SELECT id,username,balance,(SELECT COUNT(*) FROM orders o WHERE o.user_id=users.id AND o.status='completed') orders FROM users ORDER BY balance DESC LIMIT ?",(limit,)).fetchall()]
+    def recent_audit(self,limit=50):
+        with self.tx() as c: return [dict(r) for r in c.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?",(limit,)).fetchall()]
+
+    def get_discount(self,code):
+        with self.tx() as c:
+            r=c.execute("SELECT * FROM discount_codes WHERE code=? AND active=1",(code.upper(),)).fetchone()
+            if not r or (r["usage_limit"] and r["used_count"]>=r["usage_limit"]): return None
+            return dict(r)
+    def reserve_discount(self,code):
+        with self.tx() as c:
+            q="SELECT * FROM discount_codes WHERE code=? AND active=1"+(" FOR UPDATE" if self.backend=="postgresql" else "")
+            r=c.execute(q,(code.upper(),)).fetchone()
+            if not r or (r["usage_limit"] and r["used_count"]>=r["usage_limit"]): return None
+            changed=c.execute("UPDATE discount_codes SET used_count=used_count+1 WHERE code=? AND active=1 AND (usage_limit=0 OR used_count<usage_limit)",(code.upper(),)).rowcount
+            return int(r["percent"]) if changed==1 else None
+    def release_discount(self,code):
+        with self.tx() as c: c.execute("UPDATE discount_codes SET used_count=GREATEST(0,used_count-1) WHERE code=?",(code.upper(),)) if self.backend=="postgresql" else c.execute("UPDATE discount_codes SET used_count=MAX(0,used_count-1) WHERE code=?",(code.upper(),))
+
+    def tickets_for(self,uid):
+        with self.tx() as c: return [dict(r) for r in c.execute("SELECT * FROM tickets WHERE user_id=? ORDER BY id DESC LIMIT 30",(uid,)).fetchall()]
+    def lottery_winner(self):
+        with self.tx() as c:
+            rows=c.execute("SELECT user_id FROM lottery_entries ORDER BY id").fetchall()
+            if not rows:return None
+            import secrets
+            return int(secrets.choice(rows)[0])
+
+    def record_referral(self,inviter,invitee,bonus=0):
+        if inviter==invitee:return False
+        with self.tx() as c:
+            cur=c.execute("INSERT INTO referrals(inviter_id,invitee_id,bonus_amount,created_at) VALUES(?,?,?,?) ON CONFLICT(invitee_id) DO NOTHING",(inviter,invitee,bonus,now()))
+            if cur.rowcount!=1:return False
+            if bonus>0:
+                c.execute("UPDATE users SET balance=balance+? WHERE id=?",(bonus,inviter))
+                c.execute("INSERT INTO ledger(user_id,amount,kind,ref,created_at) VALUES(?,?,?,?,?)",(inviter,bonus,"referral",f"referral:{invitee}",now()))
+            return True
+    def referral_stats(self,uid):
+        with self.tx() as c:
+            r=c.execute("SELECT COUNT(*) n,COALESCE(SUM(bonus_amount),0) bonus FROM referrals WHERE inviter_id=?",(uid,)).fetchone()
+            return dict(r)
+
+    def service_for_user(self,service_id,uid):
+        with self.tx() as c:
+            r=c.execute("SELECT s.*,v.url,v.username panel_username,v.password_enc,v.panel_type,v.active server_active,v.name server_name FROM services s JOIN servers v ON v.id=s.server_id WHERE s.id=? AND s.user_id=?",(service_id,uid)).fetchone()
+            return dict(r) if r else None
+    def update_service_entitlements(self,service_id,uid,data_limit_bytes=None,expires_at=None):
+        with self.tx() as c:
+            fields=[];params=[]
+            if data_limit_bytes is not None: fields.append("data_limit_bytes=?");params.append(int(data_limit_bytes))
+            if expires_at is not None: fields.append("expires_at=?");params.append(expires_at)
+            if not fields:return False
+            params.extend([service_id,uid])
+            return c.execute("UPDATE services SET "+",".join(fields)+" WHERE id=? AND user_id=?",(tuple(params))).rowcount==1
+    def debit_wallet(self,uid,amount,ref,kind="service_addon"):
+        if amount<=0:raise ValueError("amount must be positive")
+        with self.tx() as c:
+            lock=" FOR UPDATE" if self.backend=="postgresql" else ""
+            u=c.execute("SELECT balance,is_blocked FROM users WHERE id=?"+lock,(uid,)).fetchone()
+            if not u:raise ValueError("کاربر پیدا نشد.")
+            if u["is_blocked"]:raise ValueError("حساب کاربری مسدود است.")
+            if u["balance"]<amount:raise ValueError("موجودی کیف پول کافی نیست.")
+            c.execute("UPDATE users SET balance=balance-? WHERE id=?",(amount,uid))
+            c.execute("INSERT INTO ledger(user_id,amount,kind,ref,created_at) VALUES(?,?,?,?,?)",(uid,-amount,kind,ref,now()))
+            return int(u["balance"])-amount
+
+    def top_buyers(self,limit=10):
+        with self.tx() as c:
+            return [dict(r) for r in c.execute("""SELECT u.id,u.username,COUNT(o.id) orders,COALESCE(SUM(o.amount),0) purchased
+                FROM users u LEFT JOIN orders o ON o.user_id=u.id AND o.status='completed'
+                GROUP BY u.id,u.username ORDER BY purchased DESC,orders DESC LIMIT ?""",(limit,)).fetchall()]
+    def top_depositors(self,limit=10):
+        with self.tx() as c:
+            return [dict(r) for r in c.execute("""SELECT u.id,u.username,COALESCE(SUM(l.amount),0) deposited
+                FROM users u LEFT JOIN ledger l ON l.user_id=u.id AND l.kind='deposit'
+                GROUP BY u.id,u.username ORDER BY deposited DESC LIMIT ?""",(limit,)).fetchall()]
+    def top_active_services(self,limit=10):
+        with self.tx() as c:
+            return [dict(r) for r in c.execute("""SELECT u.id,u.username,COUNT(s.id) active_services
+                FROM users u LEFT JOIN services s ON s.user_id=u.id AND s.status='active'
+                GROUP BY u.id,u.username ORDER BY active_services DESC LIMIT ?""",(limit,)).fetchall()]

@@ -1,5 +1,5 @@
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 
 class PasarGuardError(RuntimeError):
@@ -17,7 +17,7 @@ class PasarGuardClient:
         if r.status_code>=400:
             try: detail=r.json()
             except ValueError: detail=r.text[:500]
-            raise PasarGuardError(f'PasarGuard API {r.status_code}: {detail}',uncertain=(method.upper()=='POST' and r.status_code>=500))
+            raise PasarGuardError(f'PasarGuard API {r.status_code}: {detail}',uncertain=(method.upper() in {'POST','PUT'} and r.status_code>=500))
         if not r.content:return {}
         try:return r.json()
         except ValueError:raise PasarGuardError('پاسخ پنل JSON معتبر نیست.',uncertain=method.upper()=='POST')
@@ -58,6 +58,78 @@ class PasarGuardClient:
         return result,sub
     def get_user(self,username):
         self.ensure_login(); return self._request('GET',f'/api/user/{quote(username,safe="")}')
+
+
+    @staticmethod
+    def _as_datetime(value):
+        if value in (None, 0, "0", ""):
+            return None
+        if isinstance(value,(int,float)):
+            return datetime.fromtimestamp(value,timezone.utc)
+        if isinstance(value,str):
+            try:
+                parsed=datetime.fromisoformat(value.replace("Z","+00:00"))
+                return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+            except ValueError:
+                try:return datetime.fromtimestamp(float(value),timezone.utc)
+                except Exception:return None
+        return None
+
+    def extend_user(self,username,add_gb=0,add_days=0):
+        """Add quota/time through PasarGuard's documented PUT /api/user/{username} endpoint.
+        The operation is reconciled with GET after transport/5xx uncertainty; it never repeats
+        the mutation blindly.
+        """
+        if self.__class__.__name__ == "MarzneshinClient":
+            raise PasarGuardError("تمدید/افزایش حجم برای Marzneshin در این نسخه پشتیبانی نمی‌شود.")
+        if add_gb < 0 or add_days < 0 or (add_gb == 0 and add_days == 0):
+            raise ValueError("مقدار افزایش باید مثبت باشد.")
+        path=f'/api/user/{quote(username,safe="")}'
+        try:
+            self.ensure_login()
+            try:
+                before=self._request("GET",path)
+            except PasarGuardError as exc:
+                if "401" not in str(exc): raise
+                self._token=None;self.login();before=self._request("GET",path)
+        except (requests.Timeout,requests.ConnectionError) as exc:
+            raise PasarGuardError("اتصال پیش از اعمال تغییر برقرار نشد؛ مبلغ قابل بازگشت است.",False) from exc
+        payload={}
+        target_limit=int(before.get("data_limit") or 0)
+        target_expire=self._as_datetime(before.get("expire"))
+        if add_gb:
+            if target_limit<=0: raise ValueError("حجم این سرویس نامحدود است؛ افزایش حجم برای آن معنی ندارد.")
+            target_limit += int(add_gb)*1024**3
+            payload["data_limit"]=target_limit
+        if add_days:
+            if target_expire is None: raise ValueError("اعتبار این سرویس نامحدود است؛ تمدید زمانی لازم نیست.")
+            base=max(target_expire,datetime.now(timezone.utc))
+            target_expire=base+timedelta(days=int(add_days))
+            payload["expire"]=target_expire.isoformat()
+        try:
+            try:
+                result=self._request("PUT",path,json=payload)
+            except PasarGuardError as auth_exc:
+                if "401" not in str(auth_exc) or auth_exc.uncertain: raise
+                self._token=None;self.login()
+                result=self._request("PUT",path,json=payload)
+        except (requests.Timeout,requests.ConnectionError,PasarGuardError) as exc:
+            if isinstance(exc,PasarGuardError) and not exc.uncertain:
+                raise
+            # A PUT may have committed. Read back once and compare the absolute target values.
+            try:
+                after=self._request("GET",path)
+            except Exception as check_exc:
+                raise PasarGuardError("نتیجه تغییر سرویس پس از قطع ارتباط نامشخص است؛ مبلغ باید تا بررسی مدیر محفوظ بماند.",True) from check_exc
+            actual_limit=int(after.get("data_limit") or 0)
+            actual_expire=self._as_datetime(after.get("expire"))
+            limit_ok=(not add_gb or actual_limit==target_limit)
+            expire_ok=(not add_days or (actual_expire is not None and abs((actual_expire-target_expire).total_seconds())<5))
+            if not (limit_ok and expire_ok):
+                raise PasarGuardError("تغییر سرویس در پنل تأیید نشد و نتیجه نیازمند بررسی دستی است.",True) from exc
+            result=after
+        return result, (target_limit if add_gb else None), (target_expire.isoformat() if add_days else None)
+
 
 class MarzbanClient(PasarGuardClient):
     """Secondary adapter for Marzban-compatible installations."""

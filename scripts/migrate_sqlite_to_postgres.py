@@ -4,8 +4,8 @@ import argparse, os, sqlite3
 from dotenv import load_dotenv
 import psycopg
 from psycopg.rows import dict_row
-TABLES=['users','servers','products','orders','deposits','ledger','settings','services','tickets','ticket_messages','admin_roles','audit_logs','payments','service_events']
-SEQUENCES=['servers','products','deposits','ledger','services','tickets','ticket_messages','audit_logs','payments','service_events']
+TABLES=['users','servers','products','orders','deposits','ledger','settings','services','tickets','ticket_messages','admin_roles','audit_logs','payments','service_events','categories','discount_codes','gift_codes','gift_redemptions','resellers','referrals','channel_settings','lottery_entries','bot_buttons']
+SEQUENCES=['servers','products','deposits','ledger','services','tickets','ticket_messages','audit_logs','payments','service_events','categories','gift_redemptions','lottery_entries']
 def main():
     load_dotenv();ap=argparse.ArgumentParser();ap.add_argument('--sqlite',default=os.getenv('DATABASE_PATH','data/sonarx.sqlite3'));ap.add_argument('--merge',action='store_true');a=ap.parse_args()
     url=os.getenv('DATABASE_URL','')
