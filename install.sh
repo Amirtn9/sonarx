@@ -2,11 +2,15 @@
 set -Eeuo pipefail
 REPO_URL="${SONARX_REPO_URL:-https://github.com/Amirtn9/sonarx.git}"
 BRANCH="${SONARX_BRANCH:-main}"
-APP_DIR="/opt/sonarx"
+APP_DIR="${SONARX_APP_DIR:-/opt/sonarx}"
 SERVICE="sonarx"
-LOG_FILE="/var/log/sonarx-install.log"
-mkdir -p "$(dirname "$LOG_FILE")"
-exec > >(tee -a "$LOG_FILE") 2>&1
+PERSIST_DIR="${SONARX_PERSIST_DIR:-/var/lib/sonarx}"
+BACKUP_DIR="${SONARX_BACKUP_DIR:-/var/backups/sonarx}"
+LOG_FILE="${SONARX_LOG_FILE:-/var/log/sonarx-install.log}"
+if [[ "${SONARX_INSTALL_LIB_ONLY:-0}" != "1" ]]; then
+  mkdir -p "$(dirname "$LOG_FILE")"
+  exec > >(tee -a "$LOG_FILE") 2>&1
+fi
 
 c(){ if [[ -t 1 ]]; then printf '\033[%sm%s\033[0m\n' "$1" "$2"; else printf '%s\n' "$2"; fi; }
 ok(){ c 32 "[OK] $*"; }
@@ -15,16 +19,18 @@ warn(){ c 33 "[WARN] $*"; }
 fail(){ c 31 "[ERROR] $*"; }
 need_root(){ [[ "${EUID}" -eq 0 ]] || { fail "Run as root: sudo bash install.sh"; exit 1; }; }
 prompt(){ local __var="$1" __label="$2" __secret="${3:-0}" __value=""; [[ -r /dev/tty ]] || { fail "Interactive terminal required for this step."; exit 1; }; if [[ "$__secret" == 1 ]]; then read -r -s -p "$__label" __value </dev/tty; echo; else read -r -p "$__label" __value </dev/tty; fi; printf -v "$__var" '%s' "$__value"; }
+# Secrets are sent to Python over stdin, not process command-line arguments.
 set_env(){
-  "$APP_DIR/.venv/bin/python" - "$APP_DIR/.env" "$1" "$2" <<'PY'
-import sys
+  local key="$1" value="$2"
+  printf '%s' "$value" | "$APP_DIR/.venv/bin/python" -c '
 from pathlib import Path
-p=Path(sys.argv[1]); k=sys.argv[2]; v=sys.argv[3]
+import sys
+p=Path(sys.argv[1]); key=sys.argv[2]; value=sys.stdin.read()
 lines=p.read_text().splitlines() if p.exists() else []
-lines=[line for line in lines if not line.startswith(k+"=")]
-lines.append(k+"="+v)
+lines=[line for line in lines if not line.startswith(key+"=")]
+lines.append(key+"="+value)
 p.write_text("\n".join(lines)+"\n")
-PY
+' "$APP_DIR/.env" "$key"
 }
 get_env(){
   "$APP_DIR/.venv/bin/python" - "$APP_DIR/.env" "$1" <<'PY'
@@ -56,9 +62,9 @@ setup_pg(){
   local pass
   pass="$(openssl rand -hex 32)"
   if runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='sonarx'" | grep -q 1; then
-    runuser -u postgres -- psql -q -v ON_ERROR_STOP=1 -c "ALTER ROLE sonarx WITH LOGIN PASSWORD '$pass'" >/dev/null
+    printf "ALTER ROLE sonarx WITH LOGIN PASSWORD '%s';\n" "$pass" | runuser -u postgres -- psql -q -v ON_ERROR_STOP=1 >/dev/null
   else
-    runuser -u postgres -- psql -q -v ON_ERROR_STOP=1 -c "CREATE ROLE sonarx LOGIN PASSWORD '$pass'" >/dev/null
+    printf "CREATE ROLE sonarx LOGIN PASSWORD '%s';\n" "$pass" | runuser -u postgres -- psql -q -v ON_ERROR_STOP=1 >/dev/null
   fi
   if ! runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_database WHERE datname='sonarx'" | grep -q 1; then
     runuser -u postgres -- createdb -O sonarx sonarx >/dev/null
@@ -67,31 +73,101 @@ setup_pg(){
   fi
   printf '%s' "$pass"
 }
+# The GitHub web uploader sometimes omits dotfiles, including .env.example.
+# Never make a missing public template fatal: create a safe template OUTSIDE the
+# Git working tree so future `git pull` operations cannot conflict with it.
+ensure_env_template(){
+  if [[ -f "$APP_DIR/.env.example" ]]; then
+    printf '%s\n' "$APP_DIR/.env.example"
+    return 0
+  fi
+  if [[ -f "$APP_DIR/env.example" ]]; then
+    printf '%s\n' "$APP_DIR/env.example"
+    return 0
+  fi
+  warn "Missing template in GitHub checkout; using built-in safe defaults." >&2
+  mkdir -p "$PERSIST_DIR"
+  chmod 700 "$PERSIST_DIR"
+  cat > "$PERSIST_DIR/env.defaults" <<'DEFAULT_ENV'
+BOT_TOKEN=replace_me
+ADMIN_IDS=123456789
+DATABASE_URL=
+DATABASE_PATH=data/sonarx.sqlite3
+DB_POOL_SIZE=10
+TIMEZONE=Asia/Tehran
+PASARGUARD_VERIFY_TLS=true
+FERNET_KEY=generate_with_python_cryptography
+CURRENCY_LABEL=تومان
+SUPPORT_USERNAME=
+POSTGRES_PASSWORD=
+ORDER_RECOVERY_MINUTES=15
+SERVICE_SYNC_BATCH=500
+DEFAULT_ENV
+  chmod 600 "$PERSIST_DIR/env.defaults"
+  printf '%s\n' "$PERSIST_DIR/env.defaults"
+}
+
+# Save the database URL, Fernet key and bot identity, NOT just the database.
+# Database-only backups cannot recover Fernet-encrypted panel credentials.
+backup_config(){
+  [[ -f "$APP_DIR/.env" ]] || return 0
+  mkdir -p "$PERSIST_DIR" "$BACKUP_DIR/config"
+  chmod 700 "$PERSIST_DIR" "$BACKUP_DIR" "$BACKUP_DIR/config"
+  install -m 600 "$APP_DIR/.env" "$PERSIST_DIR/.env"
+  cp -p "$APP_DIR/.env" "$BACKUP_DIR/config/sonarx-$(date +%Y%m%d-%H%M%S)-$$.env"
+  chmod 600 "$PERSIST_DIR/.env" "$BACKUP_DIR/config/"*.env
+}
+
+# When an old PostgreSQL database exists but .env was already deleted by an
+# older uninstaller, DO NOT silently reset DB credentials and the Fernet key.
+confirm_lost_configuration(){
+  local existing
+  existing="$(runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_database WHERE datname='sonarx'" 2>/dev/null || true)"
+  [[ "$existing" == "1" ]] || return 0
+  warn "An existing SonarX PostgreSQL database was found, but the original .env is missing."
+  warn "Its encrypted panel passwords require the ORIGINAL FERNET_KEY to decrypt."
+  warn "A fresh Fernet key CANNOT recover previously encrypted panel credentials."
+  warn "Check backups in $PERSIST_DIR or $BACKUP_DIR/config before continuing."
+  local answer
+  prompt answer "To keep the existing database but create NEW credentials, type RECONFIGURE: "
+  [[ "$answer" == "RECONFIGURE" ]] || { fail "Install stopped safely. Restore original .env and retry."; return 1; }
+}
+
 configure(){
-  local migrated=0 dburl key token admins pass
+  local migrated=0 dburl key token admins pass template
   if [[ ! -f "$APP_DIR/.env" ]]; then
-    if [[ ! -f "$APP_DIR/.env.example" ]]; then
-      fail ".env.example is missing from the GitHub release."
-      exit 1
+    if [[ -f "$PERSIST_DIR/.env" ]]; then
+      info "Restoring preserved configuration from $PERSIST_DIR/.env"
+      install -m 600 "$PERSIST_DIR/.env" "$APP_DIR/.env"
+    else
+      template="$(ensure_env_template)"
+      cp "$template" "$APP_DIR/.env"
+      chmod 600 "$APP_DIR/.env"
     fi
-    cp "$APP_DIR/.env.example" "$APP_DIR/.env"
+  fi
+  if [[ -z "$(get_env BOT_TOKEN)" || "$(get_env BOT_TOKEN)" == "replace_me" ]]; then
     prompt token "Telegram BOT_TOKEN (input hidden): " 1
     prompt admins "Telegram ADMIN_IDS (comma-separated numeric IDs): "
     [[ -n "$token" && -n "$admins" ]] || { fail "BOT_TOKEN and ADMIN_IDS are required."; exit 1; }
-    "$APP_DIR/.venv/bin/python" - "$token" "$admins" <<'PY'
+    printf '%s\n%s\n' "$token" "$admins" | "$APP_DIR/.venv/bin/python" -c '
 import re,sys,urllib.request,json
-token,ids=sys.argv[1:]
-if not re.fullmatch(r'[0-9]{5,15}:[A-Za-z0-9_-]{20,}',token): raise SystemExit("Invalid Telegram token format")
-if not all(re.fullmatch(r'[0-9]{4,20}',x.strip()) for x in ids.split(',') if x.strip()): raise SystemExit("ADMIN_IDS must be numeric")
-req=urllib.request.Request(f'https://api.telegram.org/bot{token}/getMe')
-with urllib.request.urlopen(req,timeout=15) as r: data=json.loads(r.read())
-if not data.get('ok'): raise SystemExit("Telegram rejected the token")
-print("Validated bot:", "@"+data['result'].get('username',''))
-PY
+lines=sys.stdin.read().splitlines()
+if len(lines)!=2: raise SystemExit("Missing bot token or admin IDs")
+token,ids=lines
+if not re.fullmatch(r"[0-9]{5,15}:[A-Za-z0-9_-]{20,}",token): raise SystemExit("Invalid Telegram token format")
+admins=[x.strip() for x in ids.split(",") if x.strip()]
+if not admins or not all(re.fullmatch(r"[0-9]{4,20}",x) for x in admins): raise SystemExit("ADMIN_IDS must be numeric")
+try:
+    req=urllib.request.Request("https://api.telegram.org/bot"+token+"/getMe")
+    with urllib.request.urlopen(req,timeout=15) as r: data=json.loads(r.read())
+except Exception: raise SystemExit("Unable to validate bot token against Telegram; check token and network.")
+if not data.get("ok"): raise SystemExit("Telegram rejected the token")
+print("Validated bot:", "@"+data["result"].get("username",""))
+'
     set_env BOT_TOKEN "$token"
     set_env ADMIN_IDS "$admins"
   else
-    warn "Existing .env preserved; secrets will not be overwritten."
+    info "Existing/previously restored BOT_TOKEN preserved."
   fi
   token="$(get_env BOT_TOKEN)"
   admins="$(get_env ADMIN_IDS)"
@@ -113,6 +189,10 @@ if not items or any(not re.fullmatch(r"[0-9]{4,20}",x) for x in items): raise Sy
 PY
   dburl="$(get_env DATABASE_URL)"
   if [[ -z "$dburl" ]]; then
+    # Re-check even if an earlier failed attempt left a placeholder .env.
+    if [[ ! -f "$PERSIST_DIR/.env" ]]; then
+      confirm_lost_configuration || return 1
+    fi
     pass="$(setup_pg)"
     dburl="postgresql+psycopg://sonarx:${pass}@127.0.0.1:5432/sonarx"
     set_env DATABASE_URL "$dburl";set_env POSTGRES_PASSWORD "$pass";migrated=1
@@ -126,6 +206,7 @@ PY
     set_env FERNET_KEY "$key"
   fi
   chmod 600 "$APP_DIR/.env"
+  backup_config
   printf '%s\n' "$migrated" > "$APP_DIR/.migration-needed"
 }
 install_app(){
@@ -170,6 +251,7 @@ update_app(){
   [[ -d "$APP_DIR/.git" ]] || { fail "SonarX is not installed."; exit 1; }
   local old_head
   old_head="$(git -C "$APP_DIR" rev-parse HEAD)"
+  backup_config
   systemctl stop "$SERVICE" || true
   mkdir -p /var/backups/sonarx
   chmod 700 /var/backups/sonarx
@@ -204,15 +286,24 @@ update_app(){
 }
 remove_app(){
   need_root
-  warn "This removes app code/service only. PostgreSQL database and role are preserved."
+  warn "Uninstall preserves PostgreSQL and securely backs up .env / Fernet / local data."
   prompt answer "Remove application files? Type REMOVE to confirm: "
   [[ "$answer" == "REMOVE" ]] || { info "Cancelled."; return; }
+  backup_config
+  mkdir -p "$BACKUP_DIR" "$PERSIST_DIR"
+  chmod 700 "$BACKUP_DIR" "$PERSIST_DIR"
+  if [[ -d "$APP_DIR/data" ]]; then
+    local saved_data="$BACKUP_DIR/data-$(date +%Y%m%d-%H%M%S)-$$"
+    cp -a "$APP_DIR/data" "$saved_data"
+    chmod 700 "$saved_data"
+    info "Local database files preserved in $saved_data"
+  fi
   systemctl disable --now "$SERVICE" || true
   systemctl disable --now sonarx-maintenance.timer || true
   rm -f /etc/systemd/system/sonarx.service /etc/systemd/system/sonarx-maintenance.service /etc/systemd/system/sonarx-maintenance.timer /usr/local/bin/sonarx
   systemctl daemon-reload
   rm -rf "$APP_DIR"
-  ok "Application removed; database preserved."
+  ok "Application removed. PostgreSQL retained; credentials kept in $PERSIST_DIR/.env"
 }
 menu(){
   need_root
@@ -243,6 +334,7 @@ menu(){
     esac
   done
 }
+if [[ "${SONARX_INSTALL_LIB_ONLY:-0}" != "1" ]]; then
 case "${1:-menu}" in
   install) install_app;;
   update) update_app;;
@@ -252,3 +344,4 @@ case "${1:-menu}" in
   menu) menu;;
   *) echo "Usage: install.sh [menu|install|update|remove|status|logs]";exit 2;;
 esac
+fi

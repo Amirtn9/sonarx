@@ -1,3 +1,12 @@
+## 6.3.2 — Installer recovery and credential preservation
+
+- Fixes installation failure when `.env.example` is omitted during GitHub upload.
+- Includes non-hidden `env.example` plus an embedded safe fallback template.
+- Preserves `.env` and Fernet key across reinstall/removal and stores encrypted config backups outside source checkout.
+- Requires explicit confirmation when an existing PostgreSQL database is found without recoverable configuration.
+- Removes bot token and PostgreSQL password from installer command-line process arguments where feasible.
+- Adds installer regression tests and GitHub CI checks for the visible template.
+
 # SonarX — Changelog
 
 ## 6.3.1 — Reliability and security fixes
