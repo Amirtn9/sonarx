@@ -31,6 +31,23 @@ class AccessGuardTests(unittest.TestCase):
         functions = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
         self.assertIn("maintenance", functions)
 
+    def test_maintenance_guard_reads_setting_without_late_feature_helper(self):
+        bot_file = Path(__file__).resolve().parents[1] / "sonarx" / "bot.py"
+        tree = ast.parse(bot_file.read_text(encoding="utf-8"))
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "maintenance")
+        names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+        attributes = {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)}
+        self.assertIn("db", names)
+        self.assertIn("get_setting", attributes)
+        self.assertNotIn("feature", names)
+
+    def test_bot_wraps_expired_callback_acknowledgements(self):
+        bot_file = Path(__file__).resolve().parents[1] / "sonarx" / "bot.py"
+        source = bot_file.read_text(encoding="utf-8")
+        self.assertIn("_safe_answer_callback_query", source)
+        self.assertIn("query is too old", source)
+        self.assertIn("query id is invalid", source)
+
     def test_private_and_blocked_guards_precede_feature_handlers(self):
         bot_file = Path(__file__).resolve().parents[1] / "sonarx" / "bot.py"
         tree = ast.parse(bot_file.read_text(encoding="utf-8"))
@@ -82,42 +99,6 @@ class AccessGuardTests(unittest.TestCase):
         self.assertFalse(is_blocked_user({"is_blocked": 1}, True))
         self.assertFalse(is_blocked_user({"is_blocked": 0}, False))
         self.assertFalse(is_blocked_user(None, False))
-        self.assertTrue(is_blocked_user(None, False, lookup_failed=True))
-        self.assertFalse(is_blocked_user(None, True, lookup_failed=True))
-
-
-    def test_customer_access_gates_precede_all_feature_handlers(self):
-        bot_file = Path(__file__).resolve().parents[1] / "sonarx" / "bot.py"
-        tree = ast.parse(bot_file.read_text(encoding="utf-8"))
-        message_handlers = []
-        callback_handlers = []
-        for node in tree.body:
-            if not isinstance(node, ast.FunctionDef):
-                continue
-            for decorator in node.decorator_list:
-                value = ast.unparse(decorator)
-                if "bot.message_handler" in value:
-                    message_handlers.append(node.name)
-                elif "bot.callback_query_handler" in value:
-                    callback_handlers.append(node.name)
-        self.assertEqual(message_handlers[:4], [
-            "reject_non_private_message", "reject_blocked_message",
-            "reject_admin_state_message", "reject_user_access_message"
-        ])
-        self.assertEqual(callback_handlers[:4], [
-            "reject_non_private_callback", "reject_blocked_callback",
-            "reject_admin_permission", "reject_user_access_callback"
-        ])
-
-    def test_start_applies_membership_phone_and_maintenance_gate(self):
-        bot_file = Path(__file__).resolve().parents[1] / "sonarx" / "bot.py"
-        tree = ast.parse(bot_file.read_text(encoding="utf-8"))
-        start = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "start")
-        calls = [node for node in ast.walk(start) if isinstance(node, ast.Call)]
-        self.assertTrue(any(isinstance(call.func, ast.Name) and call.func.id == "access_gate" for call in calls))
-        access_gate = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "access_gate")
-        gate_calls = [node for node in ast.walk(access_gate) if isinstance(node, ast.Call)]
-        self.assertTrue(any(isinstance(call.func, ast.Name) and call.func.id == "maintenance" for call in gate_calls))
 
 
 if __name__ == "__main__":

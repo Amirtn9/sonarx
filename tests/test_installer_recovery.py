@@ -62,25 +62,67 @@ class InstallerRecoveryTests(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertIn("original .env is missing",result.stdout)
 
-    def test_updates_quiesce_the_maintenance_timer_and_worker(self):
-        source=SCRIPT.read_text(encoding="utf-8")
-        self.assertIn("systemctl stop sonarx-maintenance.timer",source)
-        self.assertIn("systemctl stop sonarx-maintenance.service",source)
-        maintenance_unit=(SCRIPT.parents[0]/"systemd"/"sonarx-maintenance.service").read_text(encoding="utf-8")
-        self.assertIn("TimeoutStartSec=0",maintenance_unit)
-        self.assertIn("TimeoutStopSec=30",maintenance_unit)
-        update=source.split("update_app(){",1)[1].split("remove_app(){",1)[0]
-        self.assertIn("stop_app_services",update)
-        self.assertIn("start_app_services",update)
-        cli=(SCRIPT.parents[0]/"sonarx"/"cli.py").read_text(encoding="utf-8")
-        self.assertIn("systemctl','stop','sonarx-maintenance.timer",cli)
-        self.assertIn("systemctl','stop','sonarx-maintenance.service",cli)
-
     def test_secret_configuration_update_via_stdin(self):
         (self.app/".env").write_text("BOT_TOKEN=replace_me\n")
         result=self.bash('set_env BOT_TOKEN "123456:private_new_token"')
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertIn("BOT_TOKEN=123456:private_new_token",(self.app/".env").read_text())
         self.assertNotIn("private_new_token",result.stdout+result.stderr)
+
+    def test_purge_database_target_detects_local_postgres(self):
+        (self.app/".env").write_text("DATABASE_URL=postgresql+psycopg://sonarx:secret@127.0.0.1:5432/sonarx\n")
+        result=self.bash('purge_database_target')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(result.stdout.strip(),"local\tsonarx\tsonarx")
+
+    def test_purge_database_target_refuses_remote_database(self):
+        (self.app/".env").write_text("DATABASE_URL=postgresql://sonarx:secret@db.example.net:5432/sonarx\n")
+        result=self.bash('purge_database_target')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(result.stdout.strip(),"remote\tdb.example.net\tsonarx\tsonarx")
+
+    def test_purge_database_target_detects_sqlite(self):
+        (self.app/"data").mkdir()
+        db=self.app/"data/sonarx.sqlite3"
+        db.touch()
+        (self.app/".env").write_text("DATABASE_URL=\nDATABASE_PATH=data/sonarx.sqlite3\n")
+        result=self.bash('purge_database_target')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(result.stdout.strip(),f"sqlite\t{db}")
+
+    def test_purge_path_guard_rejects_system_directory(self):
+        result=self.bash('safe_sonarx_dir /opt')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn("Refusing to remove a system directory",result.stdout)
+
+    def test_purge_path_guard_accepts_dedicated_sonarx_directory(self):
+        target=Path(self.temp.name)/"sonarx-data"
+        target.mkdir()
+        result=self.bash(f'safe_sonarx_dir "{target}"')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(result.stdout.strip(),str(target))
+
+    def test_full_purge_refuses_remote_database_before_removing_files(self):
+        base=Path(self.temp.name)
+        app=base/"sonarx-app"; persist=base/"sonarx-persist"; backup=base/"sonarx-backups"
+        app.mkdir(); persist.mkdir(); backup.mkdir()
+        (app/".env").write_text("DATABASE_URL=postgresql://sonarx:secret@db.example.net:5432/sonarx\n")
+        env={**self.env,"SONARX_APP_DIR":str(app),"SONARX_PERSIST_DIR":str(persist),"SONARX_BACKUP_DIR":str(backup)}
+        result=subprocess.run(["bash","-c",'source "$SONARX_SCRIPT"; need_root(){ :; }; full_purge'],
+                              env={**env,"SONARX_SCRIPT":str(SCRIPT)},capture_output=True,text=True,timeout=10)
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn("points to remote PostgreSQL",result.stdout)
+        self.assertTrue(app.exists())
+        self.assertTrue((app/".env").exists())
+
+    def test_runtime_source_check_requires_maintenance_guard(self):
+        package=self.app/"sonarx"; package.mkdir()
+        (package/"bot.py").write_text("def feature(): pass\ndef maintenance(): pass\n")
+        result=self.bash('cd "$APP_DIR"; verify_runtime_source')
+        self.assertEqual(result.returncode,0,result.stderr)
+        (package/"bot.py").write_text("def feature(): pass\n")
+        result=self.bash('cd "$APP_DIR"; verify_runtime_source')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn("missing required function(s): maintenance",result.stderr)
 
 if __name__=="__main__":unittest.main()

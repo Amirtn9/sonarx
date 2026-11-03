@@ -7,18 +7,137 @@ SERVICE="sonarx"
 PERSIST_DIR="${SONARX_PERSIST_DIR:-/var/lib/sonarx}"
 BACKUP_DIR="${SONARX_BACKUP_DIR:-/var/backups/sonarx}"
 LOG_FILE="${SONARX_LOG_FILE:-/var/log/sonarx-install.log}"
+TTY_UI=0
+[[ -t 1 ]] && TTY_UI=1
 if [[ "${SONARX_INSTALL_LIB_ONLY:-0}" != "1" ]]; then
   mkdir -p "$(dirname "$LOG_FILE")"
   exec > >(tee -a "$LOG_FILE") 2>&1
 fi
 
-c(){ if [[ -t 1 ]]; then printf '\033[%sm%s\033[0m\n' "$1" "$2"; else printf '%s\n' "$2"; fi; }
+c(){
+  local color="$1"; shift
+  if [[ "$TTY_UI" == 1 && -z "${NO_COLOR:-}" ]]; then
+    printf '\033[%sm%s\033[0m\n' "$color" "$*"
+  else
+    printf '%s\n' "$*"
+  fi
+}
 ok(){ c 32 "[OK] $*"; }
 info(){ c 36 "[INFO] $*"; }
 warn(){ c 33 "[WARN] $*"; }
 fail(){ c 31 "[ERROR] $*"; }
+rule(){ printf '%s\n' '────────────────────────────────────────────────────────────────────────────'; }
+banner(){
+  local version="6.3.3"
+  [[ -f "$APP_DIR/VERSION" ]] && version="$(tr -d '[:space:]' < "$APP_DIR/VERSION")"
+  printf '\n'
+  c 36 '╔══════════════════════════════════════════════════════════════════════════╗'
+  c 36 '║                         SONARX CONTROL CENTER                           ║'
+  c 36 "║                    Telegram VPN Store • v${version}                         ║"
+  c 36 '╚══════════════════════════════════════════════════════════════════════════╝'
+}
 need_root(){ [[ "${EUID}" -eq 0 ]] || { fail "Run as root: sudo bash install.sh"; exit 1; }; }
 prompt(){ local __var="$1" __label="$2" __secret="${3:-0}" __value=""; [[ -r /dev/tty ]] || { fail "Interactive terminal required for this step."; exit 1; }; if [[ "$__secret" == 1 ]]; then read -r -s -p "$__label" __value </dev/tty; echo; else read -r -p "$__label" __value </dev/tty; fi; printf -v "$__var" '%s' "$__value"; }
+
+read_env_value(){
+  local file="$1" key="$2"
+  [[ -f "$file" ]] || return 0
+  python3 - "$file" "$key" <<'PY'
+from pathlib import Path
+import sys
+path, wanted = Path(sys.argv[1]), sys.argv[2]
+for raw in path.read_text(errors='replace').splitlines():
+    line = raw.strip()
+    if line.startswith('export '):
+        line = line[7:].lstrip()
+    name, sep, value = line.partition('=')
+    if sep and name.strip() == wanted:
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        print(value)
+        break
+PY
+}
+
+# Return only a project-specific canonical directory. Refuse root/system paths
+# and paths that could contain unrelated applications or the whole server.
+safe_sonarx_dir(){
+  local requested="$1" resolved base
+  resolved="$(realpath -m -- "$requested")" || return 1
+  case "$resolved" in
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|/var/lib|/var/backups|/var/log)
+      fail "Refusing to remove a system directory: $resolved"; return 1;;
+  esac
+  base="$(basename -- "$resolved")"
+  [[ "$base" == sonarx* ]] || {
+    fail "Unsafe purge path (must be a dedicated sonarx* directory): $requested"; return 1;
+  }
+  printf '%s\n' "$resolved"
+}
+
+# Print: local<TAB>database<TAB>role, remote<TAB>host<TAB>database<TAB>role,
+# or unknown. Only local SonarX-owned PostgreSQL databases are purgeable here.
+purge_database_target(){
+  local env_file="$APP_DIR/.env" url
+  [[ -f "$env_file" ]] || env_file="$PERSIST_DIR/.env"
+  url="$(read_env_value "$env_file" DATABASE_URL)"
+  if [[ -z "$url" ]]; then
+    local sqlite_path sqlite_real app_real persist_real sqlite_base
+    sqlite_path="$(read_env_value "$env_file" DATABASE_PATH)"
+    if [[ -n "$sqlite_path" ]]; then
+      [[ "$sqlite_path" == /* ]] || sqlite_path="$APP_DIR/$sqlite_path"
+      sqlite_real="$(realpath -m -- "$sqlite_path")"
+      app_real="$(realpath -m -- "$APP_DIR")"
+      persist_real="$(realpath -m -- "$PERSIST_DIR")"
+      sqlite_base="$(basename -- "$sqlite_real")"
+      case "$sqlite_real" in
+        "$app_real"/*|"$persist_real"/*) printf 'sqlite\t%s\n' "$sqlite_real"; return 0;;
+      esac
+      if [[ "$sqlite_base" == sonarx*.sqlite* || "$sqlite_base" == sonarx*.db ]]; then
+        printf 'sqlite\t%s\n' "$sqlite_real"
+        return 0
+      fi
+      printf 'unknown\n'
+      return 0
+    fi
+    printf 'local\tsonarx\tsonarx\n'
+    return 0
+  fi
+  python3 - "$url" <<'PY'
+import sys
+from urllib.parse import urlsplit, unquote
+url = sys.argv[1].strip()
+try:
+    parsed = urlsplit(url)
+    if not parsed.scheme.startswith('postgres'):
+        print('unknown')
+        raise SystemExit(0)
+    host = (parsed.hostname or '').lower()
+    database = unquote(parsed.path.lstrip('/'))
+    role = unquote(parsed.username or '')
+    if host in ('', 'localhost', '127.0.0.1', '::1'):
+        print('local\t{}\t{}'.format(database, role or 'sonarx'))
+    else:
+        print('remote\t{}\t{}\t{}'.format(host, database, role or ''))
+except Exception:
+    print('unknown')
+PY
+}
+
+verify_runtime_source(){
+  "$APP_DIR/.venv/bin/python" - <<'PY'
+import ast
+from pathlib import Path
+source = Path('sonarx/bot.py').read_text(encoding='utf-8')
+tree = ast.parse(source)
+functions = {node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+missing = {'maintenance', 'feature'} - functions
+if missing:
+    raise SystemExit('Unsafe SonarX source: missing required function(s): ' + ', '.join(sorted(missing)))
+print('Runtime source check: maintenance guard and feature helper are present.')
+PY
+}
 # Secrets are sent to Python over stdin, not process command-line arguments.
 set_env(){
   local key="$1" value="$2"
@@ -39,18 +158,6 @@ from dotenv import dotenv_values
 print(dotenv_values(sys.argv[1]).get(sys.argv[2]) or "")
 PY
 }
-stop_app_services(){
-  # Prevent a timer-triggered worker from importing code or migrating data
-  # while the checkout and virtualenv are being changed.
-  systemctl stop sonarx-maintenance.timer || true
-  systemctl stop sonarx-maintenance.service || true
-  systemctl stop "$SERVICE" || true
-}
-start_app_services(){
-  systemctl daemon-reload
-  systemctl enable --now "$SERVICE"
-  systemctl enable --now sonarx-maintenance.timer
-}
 install_deps(){
   info "Installing system dependencies and PostgreSQL 16..."
   apt-get update
@@ -65,7 +172,7 @@ fetch_source(){
     git -C "$APP_DIR" pull --ff-only origin "$BRANCH"
   elif [[ -e "$APP_DIR" ]]; then
     fail "$APP_DIR exists but is not a Git checkout. Preserve it; inspect before replacing."
-    return 1
+    exit 1
   else
     git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
   fi
@@ -223,28 +330,41 @@ PY
 }
 install_app(){
   need_root
+  # Prevent the bot and its maintenance worker from using files while they
+  # are being repaired or migrated.
+  systemctl stop sonarx-maintenance.timer sonarx-maintenance.service 2>/dev/null || true
   install_deps
-  stop_app_services
-  local restore_services=1
-  trap 'if [[ "${restore_services:-0}" == 1 ]]; then start_app_services || true; fi' ERR
   fetch_source
   cd "$APP_DIR"
   python3 -m venv .venv
   .venv/bin/pip install --upgrade pip wheel
   .venv/bin/pip install -r requirements.txt
+  verify_runtime_source
   configure
+  systemctl stop "$SERVICE" 2>/dev/null || true
   id sonarx >/dev/null 2>&1 || useradd --system --home "$APP_DIR" --shell /usr/sbin/nologin sonarx
   mkdir -p data logs
   chown -R root:sonarx "$APP_DIR"
   chown -R sonarx:sonarx data logs
   chmod 640 .env
-  install -m 0644 systemd/sonarx.service /etc/systemd/system/sonarx.service
-  install -m 0644 systemd/sonarx-maintenance.service /etc/systemd/system/sonarx-maintenance.service
+  python3 - "$APP_DIR" systemd/sonarx.service /etc/systemd/system/sonarx.service <<'PY'
+from pathlib import Path
+import sys
+root, source, target = sys.argv[1:]
+Path(target).write_text(Path(source).read_text().replace('/opt/sonarx', root))
+PY
+  python3 - "$APP_DIR" systemd/sonarx-maintenance.service /etc/systemd/system/sonarx-maintenance.service <<'PY'
+from pathlib import Path
+import sys
+root, source, target = sys.argv[1:]
+Path(target).write_text(Path(source).read_text().replace('/opt/sonarx', root))
+PY
   install -m 0644 systemd/sonarx-maintenance.timer /etc/systemd/system/sonarx-maintenance.timer
-  cat >/usr/local/bin/sonarx <<'WRAPPER'
+  cat >/usr/local/bin/sonarx <<WRAPPER
 #!/usr/bin/env bash
-cd /opt/sonarx
-exec /opt/sonarx/.venv/bin/python -m sonarx.cli "$@"
+export SONARX_APP_DIR="$APP_DIR"
+cd "$APP_DIR"
+exec "$APP_DIR/.venv/bin/python" -m sonarx.cli "\$@"
 WRAPPER
   chmod 0755 /usr/local/bin/sonarx
   .venv/bin/alembic upgrade head
@@ -255,9 +375,9 @@ WRAPPER
     fi
   fi
   rm -f .migration-needed
-  start_app_services
-  restore_services=0
-  trap - ERR
+  systemctl daemon-reload
+  systemctl enable --now "$SERVICE"
+  systemctl enable --now sonarx-maintenance.timer
   ok "SonarX installed. Run: sonarx status"
   info "Admin commands: sonarx token-change | sonarx admins-set ID1,ID2 | sonarx logs -n 200 -f"
 }
@@ -267,18 +387,21 @@ update_app(){
   local old_head
   old_head="$(git -C "$APP_DIR" rev-parse HEAD)"
   backup_config
-  stop_app_services
-  mkdir -p /var/backups/sonarx
-  chmod 700 /var/backups/sonarx
+  systemctl stop sonarx-maintenance.timer sonarx-maintenance.service 2>/dev/null || true
+  systemctl stop "$SERVICE" || true
+  mkdir -p "$BACKUP_DIR"
+  chmod 700 "$BACKUP_DIR"
   if [[ "$(get_env DATABASE_URL)" == postgresql* ]]; then
-    if ! /usr/local/bin/sonarx backup --output "/var/backups/sonarx/pre-update-$(date +%Y%m%d-%H%M%S).dump"; then
-      start_app_services || true
+    if ! /usr/local/bin/sonarx backup --output "$BACKUP_DIR/pre-update-$(date +%Y%m%d-%H%M%S).dump"; then
+      systemctl restart "$SERVICE" || true
+      systemctl enable --now sonarx-maintenance.timer 2>/dev/null || true
       fail "Pre-update database backup failed; update cancelled."
       return 1
     fi
   elif [[ -n "$(get_env DATABASE_PATH)" && -f "$APP_DIR/$(get_env DATABASE_PATH)" ]]; then
-    if ! cp "$APP_DIR/$(get_env DATABASE_PATH)" "/var/backups/sonarx/pre-update-$(date +%Y%m%d-%H%M%S).sqlite3"; then
-      start_app_services || true
+    if ! cp "$APP_DIR/$(get_env DATABASE_PATH)" "$BACKUP_DIR/pre-update-$(date +%Y%m%d-%H%M%S).sqlite3"; then
+      systemctl restart "$SERVICE" || true
+      systemctl enable --now sonarx-maintenance.timer 2>/dev/null || true
       fail "SQLite backup failed; update cancelled."
       return 1
     fi
@@ -287,26 +410,27 @@ update_app(){
          git -C "$APP_DIR" pull --ff-only origin "$BRANCH" &&
          cd "$APP_DIR" &&
          .venv/bin/pip install -r requirements.txt &&
+         verify_runtime_source &&
          .venv/bin/alembic upgrade head; }; then
     warn "Update failed; restoring previous source revision."
     git -C "$APP_DIR" reset --hard "$old_head" || true
     (cd "$APP_DIR" && .venv/bin/pip install -r requirements.txt) || true
-    start_app_services || true
+    systemctl restart "$SERVICE" || true
+    systemctl enable --now sonarx-maintenance.timer 2>/dev/null || true
     fail "Update did not complete. Check /var/log/sonarx-install.log and database migration state."
     return 1
   fi
-  start_app_services
+  systemctl restart "$SERVICE"
+  systemctl enable --now sonarx-maintenance.timer
   ok "SonarX updated."
 }
 remove_app(){
   need_root
-  warn "Uninstall preserves PostgreSQL and securely backs up .env / Fernet / local data."
-  prompt answer "Remove application files? Type REMOVE to confirm: "
-  [[ "$answer" == "REMOVE" ]] || { info "Cancelled."; return; }
-  backup_config || { fail "Configuration backup failed; uninstall cancelled."; return 1; }
-  stop_app_services
-  local restore_services=1
-  trap 'if [[ "${restore_services:-0}" == 1 ]]; then start_app_services || true; fi' ERR
+  local answer
+  warn "This removes application files only. PostgreSQL, database, backups and credentials are preserved."
+  prompt answer "To remove application files, type REMOVE: "
+  [[ "$answer" == "REMOVE" ]] || { info "Cancelled."; return 0; }
+  backup_config
   mkdir -p "$BACKUP_DIR" "$PERSIST_DIR"
   chmod 700 "$BACKUP_DIR" "$PERSIST_DIR"
   if [[ -d "$APP_DIR/data" ]]; then
@@ -315,44 +439,214 @@ remove_app(){
     chmod 700 "$saved_data"
     info "Local database files preserved in $saved_data"
   fi
-  restore_services=0
-  trap - ERR
-  systemctl disable --now "$SERVICE" || true
-  systemctl disable --now sonarx-maintenance.timer || true
+  systemctl disable --now "$SERVICE" 2>/dev/null || true
+  systemctl disable --now sonarx-maintenance.timer 2>/dev/null || true
+  systemctl stop sonarx-maintenance.service 2>/dev/null || true
   rm -f /etc/systemd/system/sonarx.service /etc/systemd/system/sonarx-maintenance.service /etc/systemd/system/sonarx-maintenance.timer /usr/local/bin/sonarx
+  rm -rf /etc/systemd/system/sonarx.service.d /etc/systemd/system/sonarx-maintenance.service.d /etc/systemd/system/sonarx-maintenance.timer.d
   systemctl daemon-reload
-  rm -rf "$APP_DIR"
-  ok "Application removed. PostgreSQL retained; credentials kept in $PERSIST_DIR/.env"
+  rm -rf -- "$APP_DIR"
+  ok "Application files removed. PostgreSQL and all preserved data remain intact."
+  info "Configuration backup: $PERSIST_DIR/.env"
+  info "Data/backups: $BACKUP_DIR"
 }
+
+full_purge(){
+  need_root
+  local app_real persist_real backup_real log_base db_target db_scope db_rest db_name db_role db_confirm
+  local answer confirm_db sqlite_path env_file remote_host
+
+  app_real="$(safe_sonarx_dir "$APP_DIR")" || return 1
+  persist_real="$(safe_sonarx_dir "$PERSIST_DIR")" || return 1
+  backup_real="$(safe_sonarx_dir "$BACKUP_DIR")" || return 1
+
+  # Overlapping targets could make one rm -rf consume another path unexpectedly.
+  if [[ "$app_real" == "$persist_real" || "$app_real/" == "$persist_real/"* ||
+        "$persist_real/" == "$app_real/"* || "$app_real" == "$backup_real" ||
+        "$app_real/" == "$backup_real/"* || "$backup_real/" == "$app_real/"* ||
+        "$persist_real" == "$backup_real" || "$persist_real/" == "$backup_real/"* ||
+        "$backup_real/" == "$persist_real/"* ]]; then
+    fail "Purge paths overlap. Refusing to continue."; return 1
+  fi
+
+  db_target="$(purge_database_target)" || { fail "Could not inspect DATABASE_URL."; return 1; }
+  db_scope="${db_target%%$'\t'*}"
+  db_rest="${db_target#*$'\t'}"
+  if [[ "$db_scope" == "sqlite" ]]; then
+    db_name="SQLite file: ${db_rest}"
+    db_role=""
+  elif [[ "$db_scope" == "remote" ]]; then
+    remote_host="${db_rest%%$'\t'*}"
+    fail "DATABASE_URL points to remote PostgreSQL ($remote_host). No files were removed. Delete that database separately or configure a local SonarX database first."
+    return 1
+  fi
+  if [[ "$db_scope" != "local" && "$db_scope" != "sqlite" ]]; then
+    fail "DATABASE_URL is missing or not a supported local database URL. No files were removed."
+    return 1
+  fi
+  if [[ "$db_scope" == "local" ]]; then
+    IFS=$'\t' read -r db_name db_role <<< "$db_rest"
+    [[ -n "$db_name" ]] || { fail "The configured PostgreSQL database name is empty. No files were removed."; return 1; }
+    [[ "$db_name" =~ ^sonarx([_-][A-Za-z0-9_-]+)?$ ]] || {
+      fail "Refusing to drop database '$db_name': only a SonarX-named local database can be removed automatically."; return 1;
+    }
+  fi
+  db_confirm="$db_name"
+  [[ "$db_scope" == "sqlite" ]] && db_confirm="SONARX SQLITE"
+  if [[ -n "$db_role" && ! "$db_role" =~ ^sonarx([_-][A-Za-z0-9_-]+)?$ ]]; then
+    warn "PostgreSQL role '$db_role' is not SonarX-named; the database will be dropped but this shared/custom role will be retained."
+  fi
+
+  printf '\n'
+  c 31 '╔══════════════════════════════════════════════════════════════════════════╗'
+  c 31 '║                       WARNING: FULL DATA PURGE                          ║'
+  c 31 '╚══════════════════════════════════════════════════════════════════════════╝'
+  warn "This action is irreversible. It will remove:"
+  printf '  • Application/source: %s\n' "$app_real"
+  printf '  • Persistent config:  %s\n' "$persist_real"
+  printf '  • Backups:            %s\n' "$backup_real"
+  printf '  • Installer log:      %s\n' "$LOG_FILE"
+  if [[ "$db_scope" == "local" ]]; then printf '  • PostgreSQL DB:      %s (local only)\n' "$db_name"; else printf '  • SQLite DB:          %s\n' "$db_name"; fi
+  if [[ "$db_role" == sonarx* ]]; then printf '  • PostgreSQL role:    %s\n' "$db_role"; fi
+  printf '  • systemd units, CLI wrapper and dedicated sonarx OS user\n'
+  printf '\n'
+  warn "The PostgreSQL server package and other databases will NOT be removed."
+  prompt answer "To continue, type exactly PURGE SONARX: "
+  [[ "$answer" == "PURGE SONARX" ]] || { info "Cancelled. Nothing was removed."; return 0; }
+  prompt confirm_db "For the final confirmation, type '$db_confirm': "
+  [[ "$confirm_db" == "$db_confirm" ]] || { info "Final confirmation did not match. Nothing was removed."; return 0; }
+
+  if [[ "$db_scope" == "local" ]] && { ! command -v runuser >/dev/null 2>&1 || ! command -v dropdb >/dev/null 2>&1; }; then
+    fail "PostgreSQL administration tools are unavailable. Nothing was removed; install/repair PostgreSQL tools and retry."
+    return 1
+  fi
+
+  info "Stopping SonarX services..."
+  systemctl disable --now "$SERVICE" 2>/dev/null || true
+  systemctl disable --now sonarx-maintenance.timer 2>/dev/null || true
+  systemctl stop sonarx-maintenance.service 2>/dev/null || true
+
+  if [[ "$db_scope" == "local" ]]; then
+    if ! systemctl is-active --quiet postgresql; then
+      if ! systemctl start postgresql; then
+        fail "Could not start local PostgreSQL. Project files were not removed."
+        systemctl restart "$SERVICE" 2>/dev/null || true
+        systemctl enable --now sonarx-maintenance.timer 2>/dev/null || true
+        return 1
+      fi
+    fi
+    info "Dropping local SonarX database '$db_name'..."
+    if ! runuser -u postgres -- dropdb --if-exists --force "$db_name"; then
+      fail "Could not drop database '$db_name'. Project files were not removed; fix PostgreSQL and retry."
+      systemctl restart "$SERVICE" 2>/dev/null || true
+      systemctl enable --now sonarx-maintenance.timer 2>/dev/null || true
+      return 1
+    fi
+    if [[ "$db_role" == sonarx* ]]; then
+      if runuser -u postgres -- dropuser --if-exists "$db_role"; then
+        ok "PostgreSQL role '$db_role' removed."
+      else
+        warn "PostgreSQL role '$db_role' still has dependencies and was retained. Other databases were not modified."
+      fi
+    fi
+  else
+    info "SQLite data will be removed with the configured SonarX files."
+  fi
+
+  # Remove an explicitly configured external SQLite file only when its filename
+  # clearly belongs to SonarX. Paths inside APP_DIR are removed with APP_DIR.
+  env_file="$APP_DIR/.env"
+  [[ -f "$env_file" ]] || env_file="$PERSIST_DIR/.env"
+  sqlite_path="$(read_env_value "$env_file" DATABASE_PATH)"
+  if [[ -n "$sqlite_path" ]]; then
+    [[ "$sqlite_path" == /* ]] || sqlite_path="$APP_DIR/$sqlite_path"
+    sqlite_path="$(realpath -m -- "$sqlite_path")"
+    case "$sqlite_path" in
+      "$app_real"/*|"$persist_real"/*) : ;;
+      *)
+        if [[ "$(basename -- "$sqlite_path")" == sonarx*.sqlite* || "$(basename -- "$sqlite_path")" == sonarx*.db ]]; then
+          rm -f -- "$sqlite_path" "$sqlite_path-wal" "$sqlite_path-shm"
+        else
+          warn "External SQLite path was not removed because its filename is not SonarX-specific: $sqlite_path"
+        fi;;
+    esac
+  fi
+
+  info "Removing systemd units and CLI wrapper..."
+  rm -f /etc/systemd/system/sonarx.service /etc/systemd/system/sonarx-maintenance.service /etc/systemd/system/sonarx-maintenance.timer /usr/local/bin/sonarx
+  rm -rf /etc/systemd/system/sonarx.service.d /etc/systemd/system/sonarx-maintenance.service.d /etc/systemd/system/sonarx-maintenance.timer.d
+  systemctl daemon-reload
+  systemctl reset-failed sonarx.service sonarx-maintenance.service sonarx-maintenance.timer 2>/dev/null || true
+  if id sonarx >/dev/null 2>&1; then userdel sonarx 2>/dev/null || warn "Could not remove OS user 'sonarx'; inspect it manually."; fi
+
+  info "Removing SonarX source, config, backups and installer log..."
+  rm -rf -- "$app_real" "$persist_real" "$backup_real"
+  log_base="$(basename -- "$LOG_FILE")"
+  if [[ "$log_base" == sonarx-install.log || "$log_base" == sonarx-install-*.log ]]; then
+    rm -f -- "$LOG_FILE"
+  else
+    warn "Custom installer log was retained because its filename is not SonarX-specific: $LOG_FILE"
+  fi
+  ok "SonarX full purge completed."
+  info "Local SonarX database and project files were removed. PostgreSQL and unrelated databases remain."
+  info "Historical entries in the shared systemd journal are retained; deleting them would affect other services."
+  exit 0
+}
+
+show_status(){
+  local app_state service_state timer_state pg_state db_state
+  [[ -d "$APP_DIR" ]] && app_state="موجود" || app_state="پیدا نشد"
+  service_state="$(systemctl is-active "$SERVICE" 2>/dev/null || true)"; [[ -n "$service_state" ]] || service_state="ناموجود"
+  timer_state="$(systemctl is-active sonarx-maintenance.timer 2>/dev/null || true)"; [[ -n "$timer_state" ]] || timer_state="ناموجود"
+  pg_state="$(systemctl is-active postgresql 2>/dev/null || true)"; [[ -n "$pg_state" ]] || pg_state="ناموجود"
+  db_state="نامشخص"
+  if command -v runuser >/dev/null 2>&1 && command -v psql >/dev/null 2>&1 && systemctl is-active --quiet postgresql; then
+    if runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_database WHERE datname='sonarx'" 2>/dev/null | grep -q 1; then db_state="موجود"; else db_state="پیدا نشد"; fi
+  fi
+  banner
+  rule
+  printf '  مسیر برنامه:       %s  (%s)\n' "$APP_DIR" "$app_state"
+  printf '  سرویس ربات:        %s\n' "$service_state"
+  printf '  زمان‌بند تعمیرات:  %s\n' "$timer_state"
+  printf '  PostgreSQL:        %s\n' "$pg_state"
+  printf '  دیتابیس SonarX:    %s\n' "$db_state"
+  rule
+}
+
 menu(){
   need_root
   while true; do
-    echo
-    echo " SonarX — Operations Center"
-    echo " 1) Install / Repair"
-    echo " 2) Update from GitHub"
-    echo " 3) Service status + diagnostics"
-    echo " 4) Live logs"
-    echo " 5) Change Telegram bot token"
-    echo " 6) Change primary admin IDs"
-    echo " 7) Open CLI help"
-    echo " 8) Remove app (preserve database)"
-    echo " 0) Exit"
-    prompt choice "Select an option: "
+    show_status
+    printf '\n'
+    c 36 '  ┌───────────────────────── عملیات ──────────────────────────┐'
+    printf '  │  1  نصب جدید / تعمیر نصب                                  │\n'
+    printf '  │  2  بروزرسانی امن از GitHub                               │\n'
+    printf '  │  3  وضعیت و عیب‌یابی                                      │\n'
+    printf '  │  4  مشاهده زنده لاگ ربات                                  │\n'
+    printf '  │  5  تغییر توکن ربات تلگرام                                │\n'
+    printf '  │  6  تغییر شناسه مدیران                                    │\n'
+    printf '  │  7  راهنمای دستورات CLI                                   │\n'
+    printf '  │  8  حذف برنامه (حفظ دیتابیس و بکاپ)                       │\n'
+    c 31 '  │ 9 حذف کامل پروژه + دیتابیس + بکاپ‌ها (غیرقابل‌بازگشت)     │'
+    c 36 '  │  0  خروج                                                  │'
+    c 36 '  └───────────────────────────────────────────────────────────┘'
+    prompt choice "انتخاب گزینه: "
     case "$choice" in
       1) install_app;;
       2) update_app;;
-      3) systemctl status "$SERVICE" --no-pager || true; /usr/local/bin/sonarx doctor || true;;
-      4) journalctl -u "$SERVICE" -n 150 -f;;
-      5) [[ -x /usr/local/bin/sonarx ]] && /usr/local/bin/sonarx token-change || { fail "Install SonarX first."; };;
-      6) [[ -x /usr/local/bin/sonarx ]] || { fail "Install SonarX first."; continue; }; prompt ids "New ADMIN_IDS (comma-separated): "; /usr/local/bin/sonarx admins-set "$ids";;
-      7) [[ -x /usr/local/bin/sonarx ]] && /usr/local/bin/sonarx --help || { fail "Install SonarX first."; };;
+      3) show_status; /usr/local/bin/sonarx doctor 2>/dev/null || true; systemctl status "$SERVICE" --no-pager || true;;
+      4) journalctl -u "$SERVICE" -n 150 -f || true;;
+      5) [[ -x /usr/local/bin/sonarx ]] && /usr/local/bin/sonarx token-change || { fail "ابتدا SonarX را نصب کن."; };;
+      6) [[ -x /usr/local/bin/sonarx ]] || { fail "ابتدا SonarX را نصب کن."; continue; }; prompt ids "شناسه مدیران جدید (با کاما جدا شود): "; /usr/local/bin/sonarx admins-set "$ids";;
+      7) [[ -x /usr/local/bin/sonarx ]] && /usr/local/bin/sonarx --help || { fail "ابتدا SonarX را نصب کن."; };;
       8) remove_app;;
-      0) break;;
-      *) warn "Invalid option.";;
+      9) full_purge;;
+      0) info "خروج از نصب‌کننده."; break;;
+      *) warn "گزینه نامعتبر است.";;
     esac
   done
 }
+
 if [[ "${SONARX_INSTALL_LIB_ONLY:-0}" != "1" ]]; then
 case "${1:-menu}" in
   install) install_app;;
@@ -361,6 +655,7 @@ case "${1:-menu}" in
   status) need_root;systemctl status "$SERVICE" --no-pager;;
   logs) need_root;journalctl -u "$SERVICE" -n 150 -f;;
   menu) menu;;
-  *) echo "Usage: install.sh [menu|install|update|remove|status|logs]";exit 2;;
+  purge) full_purge;;
+  *) echo "Usage: install.sh [menu|install|update|remove|purge|status|logs]";exit 2;;
 esac
 fi

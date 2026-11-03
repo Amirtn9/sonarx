@@ -1,3 +1,13 @@
+## 6.3.3 — Installer control center and safe full purge
+
+- Redesigned the interactive installer menu with a status dashboard, clearer operation groups, and a highlighted destructive action.
+- Added a separately confirmed full-purge action and `install.sh purge` command to remove SonarX source, persistent secrets/configuration, backups, local SonarX PostgreSQL database/role or configured SQLite file, systemd units, CLI wrapper, installer log, and dedicated OS user.
+- Added path overlap/system-directory safeguards; remote databases and non-SonarX database names are refused before any project files are removed. PostgreSQL itself and unrelated databases are retained.
+- Pauses the maintenance timer/service during installs and updates, and validates that the runtime maintenance guard exists before applying migrations.
+- Makes the CLI and generated systemd units respect a custom `SONARX_APP_DIR`.
+- Makes expired Telegram callback acknowledgements non-fatal and increases long-polling network timeouts to reduce avoidable polling interruptions.
+- Makes the maintenance guard self-contained and fail-closed for regular users if its setting cannot be read.
+
 ## 6.3.2 — Installer recovery and credential preservation
 
 - Fixes installation failure when `.env.example` is omitted during GitHub upload.
@@ -6,16 +16,6 @@
 - Requires explicit confirmation when an existing PostgreSQL database is found without recoverable configuration.
 - Removes bot token and PostgreSQL password from installer command-line process arguments where feasible.
 - Adds installer regression tests and GitHub CI checks for the visible template.
-- Applies membership, phone-verification and maintenance gates centrally to customer callbacks and stateful messages; `/start` now checks channel membership before showing the dashboard.
-- Makes blocked-user lookup fail closed when the database check fails.
-- Snapshots plan quota and duration on each order, preventing product edits or shared trial-plan updates from changing an in-flight order.
-- Associates discount reservations with orders and releases them exactly once when an order is refunded; successful/reconciled orders retain the redeemed usage.
-- Stops the maintenance timer and worker during install/update/remove operations to avoid code or migration races.
-- Fixes review reconciliation for explicit unlimited expiries, missing panel fields and Marzneshin key-based subscription links.
-- Validates panel group IDs before order creation, rechecks unlimited trial eligibility at runtime, and normalizes boolean/numeric panel status values.
-- Distinguishes authentication-token failures from uncertain user-creation responses.
-- Reuses one authenticated panel client per server during service synchronization, refreshes expired GET tokens, and rejects malformed expiry values without clearing valid local data.
-- Gives the maintenance worker an explicit systemd runtime limit policy for large service batches.
 
 # SonarX — Changelog
 

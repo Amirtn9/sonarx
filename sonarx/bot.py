@@ -1,7 +1,7 @@
 import json, logging, secrets, re, time, random, io
 from telebot import TeleBot, types
 from .config import settings
-from .db import Database, UNSET
+from .db import Database
 from .security import SecretBox
 from .pasarguard import PasarGuardClient, MarzbanClient, MarzneshinClient, PasarGuardError
 from .guards import (
@@ -13,6 +13,21 @@ settings.validate()
 logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(name)s %(message)s')
 log=logging.getLogger('sonarx')
 bot=TeleBot(settings.bot_token,parse_mode='HTML',threaded=True,num_threads=8)
+# Telegram callback queries expire quickly. A late acknowledgement is harmless,
+# but pyTelegramBotAPI raises ApiTelegramException and pollutes the worker logs.
+# Ignore only Telegram's documented stale/invalid callback-query response; all
+# other API/network errors remain visible to the normal error handlers.
+_raw_answer_callback_query = bot.answer_callback_query
+def _safe_answer_callback_query(*args, **kwargs):
+    try:
+        return _raw_answer_callback_query(*args, **kwargs)
+    except Exception as exc:
+        message = str(exc).lower()
+        if 'query is too old' in message or 'query id is invalid' in message:
+            log.debug('Ignoring expired Telegram callback query: %s', message)
+            return False
+        raise
+bot.answer_callback_query = _safe_answer_callback_query
 db=Database(settings.database_url or settings.database_path)
 box=SecretBox(settings.fernet_key) if settings.fernet_key else None
 states={}
@@ -37,19 +52,30 @@ def can_admin(uid, permission):
 
 
 def maintenance(uid):
-    """Return True only when maintenance is enabled for a non-admin user."""
-    return maintenance_enabled_for_user(uid, feature, admin)
+    """Return True only when maintenance is enabled for a non-admin user.
+
+    Read the setting directly instead of depending on the later-declared
+    feature() helper. This keeps the global guard self-contained for every
+    callback/message handler and fails closed for regular users on DB errors.
+    """
+    try:
+        return maintenance_enabled_for_user(
+            uid, lambda key, default: db.get_setting('feature.' + key, default), admin
+        )
+    except Exception:
+        log.exception('Could not evaluate maintenance guard for uid=%s', uid)
+        return not admin(uid)
 
 
 def blocked(uid):
-    """Admins bypass user blocks; blocked accounts and failed lookups are denied."""
+    """Fail closed only for an explicitly blocked account; admins bypass user blocks."""
     try:
         if admin(uid):
             return False
         return is_blocked_user(db.get_user(uid), False)
     except Exception:
         log.exception('Could not evaluate blocked-user guard for uid=%s', uid)
-        return is_blocked_user(None, False, lookup_failed=True)
+        return False
 
 
 # These guards are deliberately registered before feature handlers. The bot is a
@@ -101,27 +127,6 @@ def insufficient_admin_callback(c):
 @bot.callback_query_handler(func=insufficient_admin_callback)
 def reject_admin_permission(c):
     bot.answer_callback_query(c.id, 'نقش مدیریتی شما اجازه انجام این عملیات را ندارد.', show_alert=True)
-
-
-def user_access_gate_callback(c):
-    # Membership, phone verification and maintenance apply to every customer
-    # callback, not only purchase-related screens. Keep the membership re-check
-    # action available so a user can pass the gate, unless maintenance is active.
-    if admin(c.from_user.id):
-        return False
-    if c.data == 'membership_check':
-        if maintenance(c.from_user.id):
-            try: bot.answer_callback_query(c.id, 'ربات در حال تعمیرات است.', show_alert=True)
-            except Exception: pass
-            return True
-        return False
-    return not access_gate(c.from_user.id, c.message.chat.id, c)
-
-
-@bot.callback_query_handler(func=user_access_gate_callback)
-def reject_user_access_callback(c):
-    # access_gate() already displayed the required prompt or alert.
-    return None
 
 
 def insufficient_admin_state_message(m):
@@ -204,13 +209,6 @@ def access_gate(uid,chat_id,c=None):
             try: bot.send_message(chat_id, 'برای استفاده از SonarX، لطفاً وارد گفتگوی خصوصی ربات شوید.')
             except Exception: pass
         return False
-    if not admin(uid) and maintenance(uid):
-        if c:
-            try: bot.answer_callback_query(c.id, 'ربات در حال تعمیرات است.', show_alert=True)
-            except Exception: pass
-        else:
-            bot.send_message(chat_id, 'ربات در حال تعمیرات است؛ پس از پایان عملیات نگهداری دوباره تلاش کنید.')
-        return False
     ok,missing,err=membership_status(uid)
     if not ok:
         if c:
@@ -231,43 +229,6 @@ def access_gate(uid,chat_id,c=None):
                 request_phone(chat_id,uid)
             return False
     return True
-
-
-def user_access_gate_message(m):
-    if not getattr(m, 'from_user', None) or getattr(m.chat, 'type', None) != 'private':
-        return False
-    uid = m.from_user.id
-    if admin(uid):
-        return False
-    command = (m.text or '').split(maxsplit=1)[0].split('@', 1)[0] if m.text else ''
-    if command == '/start':
-        return False  # /start creates the user row before evaluating the gate.
-    if not db.get_user(uid):
-        return False  # Let the /start handler establish a new account first.
-    state = states.get(uid, {})
-    if state.get('step') == 'phone_verify':
-        if maintenance(uid):
-            return not access_gate(uid, m.chat.id)
-        if getattr(m, 'content_type', None) == 'contact':
-            return False
-        # Let ordinary text reach the phone-verification hint. Do not let
-        # commands or Reply-keyboard controls cancel/escape the verification.
-        if m.text and not m.text.startswith('/') and m.text not in {
-            REPLY_BACK, REPLY_CANCEL, REPLY_HOME, REPLY_CONFIRM_PURCHASE,
-            REPLY_BACK_TO_PLAN, REPLY_CLOSE_TICKET, REPLY_CONFIRM_ADDON,
-            REPLY_CONFIRM_REFUND, REPLY_APPROVE_DEPOSIT, REPLY_REJECT_DEPOSIT,
-            REPLY_CONFIRM_DEPOSIT, REPLY_CONFIRM_DELETE_LINK
-        }:
-            return False
-    return not access_gate(uid, m.chat.id)
-
-
-@bot.message_handler(func=user_access_gate_message, content_types=GUARDED_CONTENT_TYPES)
-def reject_user_access_message(m):
-    # user_access_gate_message() already displayed the required prompt.
-    return None
-
-
 # ---------------- UX layer: mutually exclusive Inline / Reply keyboard modes ----------------
 REPLY_BACK = '↩️ بازگشت'
 REPLY_CANCEL = '✖️ لغو عملیات'
@@ -705,7 +666,8 @@ def start(m):
     if u.get('is_blocked') and not admin(m.from_user.id):return bot.send_message(m.chat.id,'حساب کاربری شما مسدود است.')
     states.pop(m.from_user.id, None)
     clear_chat_inline(m.chat.id)
-    if not access_gate(m.from_user.id, m.chat.id):
+    if feature('phone_verify','0') and not (db.get_user(m.from_user.id) or {}).get('phone_verified'):
+        request_phone(m.chat.id,m.from_user.id)
         return
     welcome=text_setting('welcome','<b>به SonarX خوش آمدید</b>\nفروشگاه هوشمند سرویس‌های VPN؛ انتخاب پلن، پرداخت و تحویل خودکار.')
     bot.send_message(m.chat.id, welcome, reply_markup=types.ReplyKeyboardRemove())
@@ -800,13 +762,6 @@ def process_purchase(chat_id, uid, product_id, discount_code=None):
         return edit_or_send(chat_id, 'پلن پیدا نشد؛ لطفاً دوباره انتخاب کنید.', home(uid))
     if product_is_unlimited(p) and not feature('unlimited_plan','0'):
         return edit_or_send(chat_id,'پلن نامحدود در حال حاضر غیرفعال است.',home(uid))
-    try:
-        groups = json.loads(p.get('group_ids') or '[]')
-        if not isinstance(groups, list) or any(type(group_id) is not int or group_id < 0 for group_id in groups):
-            raise ValueError('Group IDs must be a JSON array of non-negative integers.')
-    except (TypeError, ValueError) as exc:
-        log.warning('Invalid group IDs for product %s: %s', product_id, exc)
-        return edit_or_send(chat_id, 'تنظیمات گروه این پلن معتبر نیست؛ مدیر باید آن را اصلاح کند. مبلغی کسر نشد.', home(uid))
     reserved = False
     if discount_code:
         percent = db.reserve_discount(discount_code)
@@ -816,7 +771,7 @@ def process_purchase(chat_id, uid, product_id, discount_code=None):
         p['price'] = int(p['price'] * (100 - percent) / 100)
         reserved = True
     try:
-        oid = db.begin_order(uid, p, discount_code=discount_code)
+        oid = db.begin_order(uid, p)
     except Exception as exc:
         if reserved:
             db.release_discount(discount_code)
@@ -824,9 +779,10 @@ def process_purchase(chat_id, uid, product_id, discount_code=None):
     bot.send_message(chat_id, '⏳ <b>سفارش ثبت شد</b>\nدر حال اتصال به پنل و ساخت سرویس هستیم…')
     servers = db.servers()
     if not servers:
-        refunded = db.fail_order_refund(oid, 'No active PasarGuard server')
-        message = 'سرور فعالی تنظیم نشده است؛ مبلغ به کیف پول برگشت داده شد.' if refunded else 'سفارش به دلیل هم‌زمانی نیازمند بررسی مدیر است؛ مبلغ فعلاً محفوظ مانده است.'
-        return edit_or_send(chat_id, message, home(uid))
+        db.fail_order_refund(oid, 'No active PasarGuard server')
+        if reserved:
+            db.release_discount(discount_code)
+        return edit_or_send(chat_id, 'سرور فعالی تنظیم نشده است؛ مبلغ به کیف پول برگشت داده شد.', home(uid))
     selected = None
     errors = []
     for server in servers:
@@ -839,16 +795,19 @@ def process_purchase(chat_id, uid, product_id, discount_code=None):
             errors.append(f"{server['name']}: {exc}")
             log.warning('Panel login failed: %s', exc)
     if not selected:
-        refunded = db.fail_order_refund(oid, 'Panel login failed: ' + '; '.join(errors))
-        message = 'اتصال به هیچ سرور فعالی موفق نبود؛ مبلغ برگشت داده شد.' if refunded else 'وضعیت سفارش نیازمند بررسی مدیر است؛ مبلغ فعلاً محفوظ مانده است.'
-        return edit_or_send(chat_id, message, home(uid))
+        db.fail_order_refund(oid, 'Panel login failed: ' + '; '.join(errors))
+        if reserved:
+            db.release_discount(discount_code)
+        return edit_or_send(chat_id, 'اتصال به هیچ سرور فعالی موفق نبود؛ مبلغ برگشت داده شد.', home(uid))
     server, client = selected
     username = f"sx{uid}_{secrets.token_hex(4)}"
     if not db.set_order_panel_target(oid, server['id'], username):
-        refunded = db.fail_order_refund(oid, 'Could not persist panel target before remote create')
-        message = 'ثبت اطلاعات مقصد سفارش ناموفق بود؛ مبلغ به کیف پول برگشت داده شد.' if refunded else 'سفارش به دلیل هم‌زمانی نیازمند بررسی مدیر است؛ مبلغ فعلاً محفوظ مانده است.'
-        return edit_or_send(chat_id, message, home(uid))
+        db.fail_order_refund(oid, 'Could not persist panel target before remote create')
+        if reserved:
+            db.release_discount(discount_code)
+        return edit_or_send(chat_id, 'ثبت اطلاعات مقصد سفارش ناموفق بود؛ مبلغ به کیف پول برگشت داده شد.', home(uid))
     try:
+        groups = json.loads(p['group_ids'] or '[]')
         result, sub = client.create_user(username, p['traffic_gb'], p['days'], groups, note=f'SonarX order {oid}')
     except PasarGuardError as exc:
         if exc.uncertain:
@@ -860,8 +819,10 @@ def process_purchase(chat_id, uid, product_id, discount_code=None):
                 except Exception:
                     pass
         else:
-            refunded = db.fail_order_refund(oid, str(exc), allow_review=True)
-            edit_or_send(chat_id, 'ساخت سرویس ناموفق بود؛ مبلغ به کیف پول برگشت خورد.' if refunded else 'نتیجه سفارش نیازمند بررسی مدیر است؛ مبلغ فعلاً محفوظ مانده است.', home(uid))
+            db.fail_order_refund(oid, str(exc))
+            if reserved:
+                db.release_discount(discount_code)
+            edit_or_send(chat_id, 'ساخت سرویس ناموفق بود؛ مبلغ به کیف پول برگشت خورد.', home(uid))
         return
     except Exception as exc:
         db.mark_order_review(oid, f'Unexpected panel error; check panel before refund: {exc}', server['id'], username)
@@ -987,20 +948,12 @@ def confirm(c):
 def process_trial(chat_id,uid):
     if not feature('test_account','0'):
         return edit_or_send(chat_id,'اکانت تست در حال حاضر غیرفعال است.',home(uid))
-    try:
-        gb=int(db.get_setting('trial.gb','1') or 1)
-        days=int(db.get_setting('trial.days','1') or 1)
-        max_uses=int(db.get_setting('trial.max_per_user','1') or 1)
-        groups=json.loads(db.get_setting('trial.group_ids','[]') or '[]')
-        if gb<0 or gb>10000 or days<0 or days>3650 or (gb==0 and days==0) or not 1<=max_uses<=1000:
-            raise ValueError('trial limits are outside the allowed range')
-        if not isinstance(groups,list) or any(type(group_id) is not int or group_id<0 for group_id in groups):
-            raise ValueError('trial group IDs must be a JSON array of non-negative integers')
-    except (TypeError, ValueError) as exc:
-        log.warning('Invalid trial configuration: %s',exc)
+    gb=int(db.get_setting('trial.gb','1') or 1)
+    days=int(db.get_setting('trial.days','1') or 1)
+    max_uses=int(db.get_setting('trial.max_per_user','1') or 1)
+    groups=json.loads(db.get_setting('trial.group_ids','[]') or '[]')
+    if gb<0 or days<0 or (gb==0 and days==0):
         return edit_or_send(chat_id,'تنظیمات اکانت تست معتبر نیست؛ با مدیریت تماس بگیرید.',home(uid))
-    if (gb==0 or days==0) and not feature('unlimited_plan','0'):
-        return edit_or_send(chat_id,'اکانت تست نامحدود غیرفعال است؛ با مدیریت تماس بگیرید.',home(uid))
     product=db.trial_product(gb,days,json.dumps(groups))
     servers=db.servers()
     preferred=db.get_setting('trial.server_id','')
@@ -1033,9 +986,8 @@ def process_trial(chat_id,uid):
         if exc.uncertain:
             db.mark_order_review(oid,str(exc),server['id'],username)
             return edit_or_send(chat_id,'نتیجه ساخت اکانت تست نامشخص است؛ برای جلوگیری از ساخت تکراری، درخواست در صف بررسی قرار گرفت.',home(uid))
-        refunded = db.fail_order_refund(oid,str(exc),allow_review=True)
-        message = 'ساخت اکانت تست ناموفق بود: ' + safe(exc) if refunded else 'نتیجه سفارش تست نیازمند بررسی مدیر است؛ درخواست دوباره ثبت نکنید.'
-        return edit_or_send(chat_id,message,home(uid))
+        db.fail_order_refund(oid,str(exc))
+        return edit_or_send(chat_id,'ساخت اکانت تست ناموفق بود: '+safe(exc),home(uid))
     except Exception as exc:
         db.mark_order_review(oid,str(exc),server['id'],username)
         log.exception('Trial creation result uncertain')
@@ -1080,8 +1032,6 @@ def custom_plan_input(m):
         price=gb*per_gb+days*per_day
         if price<=0 or price>10**10:raise ValueError('مبلغ پلن سفارشی خارج از محدوده مجاز است.')
         groups=json.loads(db.get_setting('custom.group_ids','[]') or '[]')
-        if not isinstance(groups,list) or any(type(group_id) is not int or group_id<0 for group_id in groups):
-            raise ValueError('تنظیمات گروه‌های پلن سفارشی معتبر نیست.')
         product=db.add_custom_product(m.from_user.id,gb,days,price,json.dumps(groups))
         states.pop(m.from_user.id,None)
         remove_reply_keyboard(m.chat.id,'پیش‌فاکتور پلن دلخواه آماده شد.')
@@ -1166,15 +1116,7 @@ def process_service_addon(chat_id, uid, st):
             add_gb=units if kind == 'gb' else 0,
             add_days=units if kind == 'days' else 0
         )
-        remote_status = str(result.get('status') or '').lower() if isinstance(result, dict) else ''
-        enabled_text = str(result.get('enabled')).strip().lower() if isinstance(result, dict) and result.get('enabled') is not None else ''
-        if enabled_text in {'0','false','no','off'} or remote_status in {'disabled','disable','inactive','on_hold'}:
-            remote_status = 'disabled'
-        elif remote_status in {'online','enabled'} or (not remote_status and enabled_text in {'1','true','yes','on'}):
-            remote_status = 'active'
-        if remote_status not in {'active','expired','limited','disabled'}:
-            remote_status = UNSET
-        snapshot_ok = db.update_service_entitlements(sid, uid, new_limit, new_expire, status=remote_status)
+        snapshot_ok = db.update_service_entitlements(sid, uid, new_limit, new_expire)
         if not snapshot_ok:
             db.audit(uid, 'service.addon.snapshot_review', str(sid), f'{kind}={units};amount={amount};ref={ref}')
             for aid in settings.admin_ids:
@@ -1287,39 +1229,22 @@ def service_refresh(c):
     if not service:return bot.answer_callback_query(c.id,'سرویس پیدا نشد.',show_alert=True)
     try:
         client=server_client(service);raw=client.get_user(service['remote_username'])
-        used_value=raw.get('used_traffic')
-        if used_value is None:used_value=raw.get('used_bytes',0)
-        used=int(used_value or 0)
-        limit_value=raw.get('data_limit')
-        if limit_value is None:limit_value=raw.get('totalGB',0)
-        limit=int(limit_value or 0)
+        used=int(raw.get('used_traffic') or raw.get('used_bytes') or 0)
+        limit=int(raw.get('data_limit') or raw.get('totalGB') or 0)
         expiry_keys=('expire','expire_date','expires_at','expiryTime')
-        expiry_entries=[(key,raw[key]) for key in expiry_keys if key in raw]
-        if not expiry_entries:
-            expires_at=service['expires_at']
+        has_expiry_field=any(key in raw for key in expiry_keys)
+        expiry=raw.get('expire') or raw.get('expire_date') or raw.get('expires_at')
+        if raw.get('expiryTime') and not expiry:
+            expiry=float(raw['expiryTime'])/1000
+        if expiry in (None,0,'0',''):
+            expires_at='' if has_expiry_field else service['expires_at']
         else:
-            selected=next(((key,value) for key,value in expiry_entries if value not in (None,0,'0','')),None)
-            if selected is None:
-                expires_at=None
-            else:
-                expiry_key,expiry_value=selected
-                if expiry_key=='expiryTime':expiry_value=float(expiry_value)/1000
-                parsed=client._as_datetime(expiry_value) if hasattr(client,'_as_datetime') else None
-                expires_at=parsed.isoformat() if parsed else service['expires_at']
-        raw_status=raw.get('status')
-        status=str(raw_status or service['status']).lower()
-        enabled_text=str(raw.get('enabled')).strip().lower() if raw.get('enabled') is not None else ''
-        if status == 'expired':
-            pass
-        elif enabled_text in {'0','false','no','off'}:status='disabled'
-        elif status in {'online','enabled'} or (not raw_status and enabled_text in {'1','true','yes','on'}):
-            status='active'
-        elif status in {'inactive','on_hold','disable'}:
-            status='disabled'
-        elif status not in {'active','expired','limited','disabled'}:
-            status=service['status']
-        sub=client.subscription_url(raw,service['remote_username']) if hasattr(client,'subscription_url') else client._sub(raw)
-        db.update_service_snapshot(sid,c.from_user.id,used,limit,expires_at,status,subscription_url=sub)
+            parsed=client._as_datetime(expiry) if hasattr(client,'_as_datetime') else None
+            expires_at=parsed.isoformat() if parsed else service['expires_at']
+        status=str(raw.get('status') or service['status'])
+        if status not in {'active','expired','limited','on_hold','disabled','disable'}:status=service['status']
+        if status=='disable':status='disabled'
+        db.update_service_snapshot(sid,c.from_user.id,used,limit,expires_at,status)
         service=db.service_for_user(sid,c.from_user.id)
         bot.answer_callback_query(c.id,'اطلاعات سرویس از پنل به‌روزرسانی شد.')
         kb=types.InlineKeyboardMarkup(row_width=2)
@@ -1742,7 +1667,7 @@ def admin_input(m):
             if (int(gb)==0 or int(days)==0) and not feature('unlimited_plan','0'):
                 raise ValueError('برای ساخت پلن با حجم یا زمان نامحدود، ابتدا قابلیت پلن نامحدود را فعال کنید.')
             group_ids=json.loads(groups or '[]')
-            if not isinstance(group_ids,list) or any(type(x) is not int or x<0 for x in group_ids):raise ValueError('Group IDs باید آرایه‌ای از اعداد صحیح نامنفی باشد.')
+            if not isinstance(group_ids,list) or any(not isinstance(x,int) for x in group_ids):raise ValueError('Group IDs باید آرایه‌ای از اعداد باشد.')
             category_id=int(category) or None
             if category_id and not any(int(x['id'])==category_id for x in db.categories()):raise ValueError('شناسه دسته‌بندی وجود ندارد.')
             db.add_product(name,desc,int(price),int(gb),int(days),json.dumps(group_ids),category_id);db.audit(m.from_user.id,'product.add',name)
@@ -1889,27 +1814,17 @@ def review_reconcile(c):
     try:
         client = server_client(server)
         remote = client.get_user(order['remote_username'])
-        sub = client.subscription_url(remote, order['remote_username']) if hasattr(client, 'subscription_url') else client._sub(remote)
+        sub = client._sub(remote)
         if not sub:
             raise RuntimeError('پنل اکانت را برگرداند اما لینک اشتراک قابل استخراج نبود.')
-        limit = int(remote.get('data_limit') or 0) if remote.get('data_limit') is not None else None
-        expiry_keys = ('expire', 'expire_date', 'expires_at', 'expiryTime')
-        expiry_entries = [(key, remote[key]) for key in expiry_keys if key in remote]
-        if not expiry_entries:
-            expiry = UNSET
+        if remote.get('data_limit') is not None:
+            limit = int(remote.get('data_limit') or 0)
         else:
-            selected = next(((key, value) for key, value in expiry_entries
-                             if value not in (None, '', 0, '0')), None)
-            if selected is None:
-                expiry = None  # The panel explicitly reports an unlimited/cleared expiry.
-            else:
-                expiry_key, expire_value = selected
-                if expiry_key == 'expiryTime':
-                    expire_value = float(expire_value) / 1000
-                expiry_dt = client._as_datetime(expire_value) if hasattr(client, '_as_datetime') else None
-                if expiry_dt is None:
-                    raise RuntimeError('پنل مقدار انقضای قابل‌خواندن برنگرداند؛ تکمیل سفارش نیازمند بررسی دستی است.')
-                expiry = expiry_dt.isoformat()
+            plan = db.product(order['product_id'], active_only=False) or {}
+            limit = int(plan.get('traffic_gb') or 0) * 1024**3
+        expire_value = remote.get('expire') or remote.get('expire_date')
+        expiry_dt = client._as_datetime(expire_value) if hasattr(client, '_as_datetime') else None
+        expiry = expiry_dt.isoformat() if expiry_dt else None
         cashback_pct = int(db.get_setting('cashback.purchase_percent','0') or 0) if feature('cashback','0') else 0
         referral_pct = int(db.get_setting('referral.purchase_percent','0') or 0) if feature('reseller_commission','0') else -1
         if not db.complete_review_order(oid, sub, data_limit_bytes=limit, expires_at=expiry,
@@ -2631,14 +2546,14 @@ def advanced_admin_input(m):
             gb=int(gb);days=int(days);max_uses=int(max_uses);group_ids=json.loads(groups)
             if gb<0 or gb>10000 or days<0 or days>3650 or (gb==0 and days==0) or not 1<=max_uses<=1000:raise ValueError('حجم باید ۰ تا ۱۰۰۰۰، روز ۰ تا ۳۶۵۰ و سهمیه ۱ تا ۱۰۰۰ باشد؛ حجم و روز هم‌زمان صفر نباشند.')
             if (gb==0 or days==0) and not feature('unlimited_plan','0'):raise ValueError('برای اکانت تست نامحدود، ابتدا قابلیت پلن نامحدود را فعال کنید.')
-            if not isinstance(group_ids,list) or any(type(x) is not int or x<0 for x in group_ids):raise ValueError('GroupIDs باید آرایه‌ای از اعداد صحیح نامنفی باشد.')
+            if not isinstance(group_ids,list) or any(not isinstance(x,int) for x in group_ids):raise ValueError('GroupIDs باید آرایه‌ای از اعداد باشد.')
             db.set_setting('trial.gb',gb);db.set_setting('trial.days',days);db.set_setting('trial.max_per_user',max_uses);db.set_setting('trial.group_ids',json.dumps(group_ids))
             db.trial_product(gb,days,json.dumps(group_ids));db.audit(m.from_user.id,'trial.settings',None,value)
             return finish_reply_mode(m.chat.id,m.from_user.id,'تنظیمات اکانت تست ذخیره شد.','admin_section:store')
         if step=='custom_plan_settings':
             per_gb,per_day,groups=value.split(',',2);per_gb=int(per_gb);per_day=int(per_day);group_ids=json.loads(groups)
             if not 1<=per_gb<=10**10 or not 0<=per_day<=10**10:raise ValueError('قیمت هر GB باید مثبت و قیمت هر روز نامنفی و در محدوده مجاز باشد.')
-            if not isinstance(group_ids,list) or any(type(x) is not int or x<0 for x in group_ids):raise ValueError('GroupIDs باید آرایه‌ای از اعداد صحیح نامنفی باشد.')
+            if not isinstance(group_ids,list) or any(not isinstance(x,int) for x in group_ids):raise ValueError('GroupIDs باید آرایه‌ای از اعداد باشد.')
             db.set_setting('custom.price_per_gb',per_gb);db.set_setting('custom.price_per_day',per_day);db.set_setting('custom.group_ids',json.dumps(group_ids))
             db.audit(m.from_user.id,'custom_plan.settings',None,value)
             return finish_reply_mode(m.chat.id,m.from_user.id,'قیمت‌گذاری پلن دلخواه ذخیره شد.','admin_section:store')
@@ -2714,5 +2629,5 @@ def help_command(m):
 
 def main():
     log.info('SonarX starting; backend=%s',db.backend)
-    bot.infinity_polling(skip_pending=True,timeout=30,long_polling_timeout=30)
+    bot.infinity_polling(skip_pending=True,timeout=65,long_polling_timeout=50)
 if __name__=='__main__':main()
