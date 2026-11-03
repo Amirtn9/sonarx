@@ -26,15 +26,15 @@ ok(){ c 32 "[OK] $*"; }
 info(){ c 36 "[INFO] $*"; }
 warn(){ c 33 "[WARN] $*"; }
 fail(){ c 31 "[ERROR] $*"; }
-rule(){ printf '%s\n' '────────────────────────────────────────────────────────────────────────────'; }
+rule(){ printf '%s\n' '----------------------------------------------------------------------------'; }
 banner(){
   local version="6.3.3"
   [[ -f "$APP_DIR/VERSION" ]] && version="$(tr -d '[:space:]' < "$APP_DIR/VERSION")"
   printf '\n'
-  c 36 '╔══════════════════════════════════════════════════════════════════════════╗'
-  c 36 '║                         SONARX CONTROL CENTER                           ║'
-  c 36 "║                    Telegram VPN Store • v${version}                         ║"
-  c 36 '╚══════════════════════════════════════════════════════════════════════════╝'
+  c 36 '+----------------------------------------------------------------------------+'
+  c 36 '|                           SONARX CONTROL CENTER                            |'
+  c 36 "|                       Telegram VPN Store - v${version}                       |"
+  c 36 '+----------------------------------------------------------------------------+'
 }
 need_root(){ [[ "${EUID}" -eq 0 ]] || { fail "Run as root: sudo bash install.sh"; exit 1; }; }
 prompt(){ local __var="$1" __label="$2" __secret="${3:-0}" __value=""; [[ -r /dev/tty ]] || { fail "Interactive terminal required for this step."; exit 1; }; if [[ "$__secret" == 1 ]]; then read -r -s -p "$__label" __value </dev/tty; echo; else read -r -p "$__label" __value </dev/tty; fi; printf -v "$__var" '%s' "$__value"; }
@@ -216,7 +216,7 @@ DB_POOL_SIZE=10
 TIMEZONE=Asia/Tehran
 PASARGUARD_VERIFY_TLS=true
 FERNET_KEY=generate_with_python_cryptography
-CURRENCY_LABEL=تومان
+CURRENCY_LABEL=Toman
 SUPPORT_USERNAME=
 POSTGRES_PASSWORD=
 ORDER_RECOVERY_MINUTES=15
@@ -498,17 +498,17 @@ full_purge(){
   fi
 
   printf '\n'
-  c 31 '╔══════════════════════════════════════════════════════════════════════════╗'
-  c 31 '║                       WARNING: FULL DATA PURGE                          ║'
-  c 31 '╚══════════════════════════════════════════════════════════════════════════╝'
+  c 31 '+----------------------------------------------------------------------------+'
+  c 31 '|                         WARNING: FULL DATA PURGE                           |'
+  c 31 '+----------------------------------------------------------------------------+'
   warn "This action is irreversible. It will remove:"
-  printf '  • Application/source: %s\n' "$app_real"
-  printf '  • Persistent config:  %s\n' "$persist_real"
-  printf '  • Backups:            %s\n' "$backup_real"
-  printf '  • Installer log:      %s\n' "$LOG_FILE"
-  if [[ "$db_scope" == "local" ]]; then printf '  • PostgreSQL DB:      %s (local only)\n' "$db_name"; else printf '  • SQLite DB:          %s\n' "$db_name"; fi
-  if [[ "$db_role" == sonarx* ]]; then printf '  • PostgreSQL role:    %s\n' "$db_role"; fi
-  printf '  • systemd units, CLI wrapper and dedicated sonarx OS user\n'
+  printf '  - Application/source: %s\n' "$app_real"
+  printf '  - Persistent config:  %s\n' "$persist_real"
+  printf '  - Backups:            %s\n' "$backup_real"
+  printf '  - Installer log:      %s\n' "$LOG_FILE"
+  if [[ "$db_scope" == "local" ]]; then printf '  - PostgreSQL DB:      %s (local only)\n' "$db_name"; else printf '  - SQLite DB:          %s\n' "$db_name"; fi
+  if [[ "$db_role" == sonarx* ]]; then printf '  - PostgreSQL role:    %s\n' "$db_role"; fi
+  printf '  - systemd units, CLI wrapper, and dedicated sonarx OS user\n'
   printf '\n'
   warn "The PostgreSQL server package and other databases will NOT be removed."
   prompt answer "To continue, type exactly PURGE SONARX: "
@@ -595,21 +595,21 @@ full_purge(){
 
 show_status(){
   local app_state service_state timer_state pg_state db_state
-  [[ -d "$APP_DIR" ]] && app_state="موجود" || app_state="پیدا نشد"
-  service_state="$(systemctl is-active "$SERVICE" 2>/dev/null || true)"; [[ -n "$service_state" ]] || service_state="ناموجود"
-  timer_state="$(systemctl is-active sonarx-maintenance.timer 2>/dev/null || true)"; [[ -n "$timer_state" ]] || timer_state="ناموجود"
-  pg_state="$(systemctl is-active postgresql 2>/dev/null || true)"; [[ -n "$pg_state" ]] || pg_state="ناموجود"
-  db_state="نامشخص"
+  [[ -d "$APP_DIR" ]] && app_state="Installed" || app_state="Not found"
+  service_state="$(systemctl is-active "$SERVICE" 2>/dev/null || true)"; [[ -n "$service_state" ]] || service_state="Not installed"
+  timer_state="$(systemctl is-active sonarx-maintenance.timer 2>/dev/null || true)"; [[ -n "$timer_state" ]] || timer_state="Not installed"
+  pg_state="$(systemctl is-active postgresql 2>/dev/null || true)"; [[ -n "$pg_state" ]] || pg_state="Not installed"
+  db_state="Unknown"
   if command -v runuser >/dev/null 2>&1 && command -v psql >/dev/null 2>&1 && systemctl is-active --quiet postgresql; then
-    if runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_database WHERE datname='sonarx'" 2>/dev/null | grep -q 1; then db_state="موجود"; else db_state="پیدا نشد"; fi
+    if runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_database WHERE datname='sonarx'" 2>/dev/null | grep -q 1; then db_state="Present"; else db_state="Not found"; fi
   fi
   banner
   rule
-  printf '  مسیر برنامه:       %s  (%s)\n' "$APP_DIR" "$app_state"
-  printf '  سرویس ربات:        %s\n' "$service_state"
-  printf '  زمان‌بند تعمیرات:  %s\n' "$timer_state"
+  printf '  Application path:  %s  (%s)\n' "$APP_DIR" "$app_state"
+  printf '  Bot service:       %s\n' "$service_state"
+  printf '  Maintenance timer: %s\n' "$timer_state"
   printf '  PostgreSQL:        %s\n' "$pg_state"
-  printf '  دیتابیس SonarX:    %s\n' "$db_state"
+  printf '  SonarX database:   %s\n' "$db_state"
   rule
 }
 
@@ -618,31 +618,31 @@ menu(){
   while true; do
     show_status
     printf '\n'
-    c 36 '  ┌───────────────────────── عملیات ──────────────────────────┐'
-    printf '  │  1  نصب جدید / تعمیر نصب                                  │\n'
-    printf '  │  2  بروزرسانی امن از GitHub                               │\n'
-    printf '  │  3  وضعیت و عیب‌یابی                                      │\n'
-    printf '  │  4  مشاهده زنده لاگ ربات                                  │\n'
-    printf '  │  5  تغییر توکن ربات تلگرام                                │\n'
-    printf '  │  6  تغییر شناسه مدیران                                    │\n'
-    printf '  │  7  راهنمای دستورات CLI                                   │\n'
-    printf '  │  8  حذف برنامه (حفظ دیتابیس و بکاپ)                       │\n'
-    c 31 '  │ 9 حذف کامل پروژه + دیتابیس + بکاپ‌ها (غیرقابل‌بازگشت)     │'
-    c 36 '  │  0  خروج                                                  │'
-    c 36 '  └───────────────────────────────────────────────────────────┘'
-    prompt choice "انتخاب گزینه: "
+    c 36 '  +-------------------------- OPERATIONS --------------------------+'
+    printf '  |  1  Install / Repair                                             |\n'
+    printf '  |  2  Update from GitHub                                          |\n'
+    printf '  |  3  System status and diagnostics                               |\n'
+    printf '  |  4  Follow live bot logs                                        |\n'
+    printf '  |  5  Change Telegram bot token                                   |\n'
+    printf '  |  6  Change administrator IDs                                    |\n'
+    printf '  |  7  Show command-line help                                      |\n'
+    printf '  |  8  Uninstall app (keep database and backups)                   |\n'
+    c 31 '  |  9  FULL WIPE: remove app, database, config, and backups        |'
+    c 36 '  |  0  Exit                                                        |'
+    c 36 '  +----------------------------------------------------------------+'
+    prompt choice "Select an option: "
     case "$choice" in
       1) install_app;;
       2) update_app;;
       3) show_status; /usr/local/bin/sonarx doctor 2>/dev/null || true; systemctl status "$SERVICE" --no-pager || true;;
       4) journalctl -u "$SERVICE" -n 150 -f || true;;
-      5) [[ -x /usr/local/bin/sonarx ]] && /usr/local/bin/sonarx token-change || { fail "ابتدا SonarX را نصب کن."; };;
-      6) [[ -x /usr/local/bin/sonarx ]] || { fail "ابتدا SonarX را نصب کن."; continue; }; prompt ids "شناسه مدیران جدید (با کاما جدا شود): "; /usr/local/bin/sonarx admins-set "$ids";;
-      7) [[ -x /usr/local/bin/sonarx ]] && /usr/local/bin/sonarx --help || { fail "ابتدا SonarX را نصب کن."; };;
+      5) [[ -x /usr/local/bin/sonarx ]] && /usr/local/bin/sonarx token-change || { fail "SonarX is not installed yet."; };;
+      6) [[ -x /usr/local/bin/sonarx ]] || { fail "SonarX is not installed yet."; continue; }; prompt ids "Enter administrator IDs (comma-separated): "; /usr/local/bin/sonarx admins-set "$ids";;
+      7) [[ -x /usr/local/bin/sonarx ]] && /usr/local/bin/sonarx --help || { fail "SonarX is not installed yet."; };;
       8) remove_app;;
       9) full_purge;;
-      0) info "خروج از نصب‌کننده."; break;;
-      *) warn "گزینه نامعتبر است.";;
+      0) info "Exiting installer."; break;;
+      *) warn "Invalid option. Please choose a number from 0 to 9.";;
     esac
   done
 }

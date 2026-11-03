@@ -115,6 +115,13 @@ class InstallerRecoveryTests(unittest.TestCase):
         self.assertTrue(app.exists())
         self.assertTrue((app/".env").exists())
 
+    def test_installer_ui_is_english_and_readable(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIsNone(__import__("re").search(r"[\u0600-\u06FF]", source))
+        for label in ("SONARX CONTROL CENTER", "Install / Repair", "Update from GitHub",
+                      "System status and diagnostics", "FULL WIPE", "Select an option:"):
+            self.assertIn(label, source)
+
     def test_runtime_source_check_requires_maintenance_guard(self):
         package=self.app/"sonarx"; package.mkdir()
         (package/"bot.py").write_text("def feature(): pass\ndef maintenance(): pass\n")
