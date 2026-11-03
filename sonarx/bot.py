@@ -20,6 +20,11 @@ def admin(uid):
 
 def safe(v):return str(v).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
 def fmt(v):return f'{int(v):,} {settings.currency_label}'
+def usage_bar(used,limit,width=10):
+    if not limit or limit<=0:return 'نامحدود'
+    ratio=max(0,min(1,float(used or 0)/float(limit)))
+    filled=round(ratio*width)
+    return '▰'*filled+'▱'*(width-filled)+f' {ratio*100:.0f}%'
 def feature(key,default='1'):return db.get_setting('feature.'+key,default)=='1'
 def text_setting(key,default):return db.get_setting('text.'+key,default)
 def server_client(row):
@@ -27,20 +32,20 @@ def server_client(row):
     cls={'pasarguard':PasarGuardClient,'marzban':MarzbanClient,'marzneshin':MarzneshinClient}.get(row.get('panel_type','pasarguard'))
     if not cls:raise RuntimeError('نوع پنل پشتیبانی نمی‌شود: '+str(row.get('panel_type')))
     return cls(row['url'],row['username'],box.decrypt(row['password_enc']),settings.verify_tls)
-def user_reply_keyboard(uid):
-    # Telegram supports one reply_markup per message. We keep this persistent
-    # reply keyboard for navigation and use inline keyboards in each feature screen.
-    k=types.ReplyKeyboardMarkup(resize_keyboard=True,row_width=2)
-    def enabled(key): return db.get_setting('button.'+key+'.enabled','1')=='1'
-    row=[]
-    for key,label in [('shop','🛒 خرید سرویس'),('profile','👤 حساب من'),('orders','📦 سرویس‌های من'),('deposit','💳 افزایش موجودی'),('support','🎫 پشتیبانی'),('gift','🎁 کد هدیه'),('tutorials','📚 آموزش اتصال'),('faq','❓ سوالات متداول')]:
-        if enabled(key):
-            row.append(types.KeyboardButton(label))
-            if len(row)==2: k.add(*row);row=[]
-    if row:k.add(*row)
-    k.add(types.KeyboardButton('🎟 تیکت‌های من'),types.KeyboardButton('🎲 شانس و جایزه'))
-    if admin(uid): k.add(types.KeyboardButton('⚙️ پنل مدیریت'))
-    return k
+def temporary_action_keyboard(*labels):
+    """Reply keyboard reserved for a short confirmation/input step only."""
+    kb=types.ReplyKeyboardMarkup(resize_keyboard=True,row_width=2,one_time_keyboard=True)
+    kb.add(*[types.KeyboardButton(x) for x in labels])
+    return kb
+
+def remove_temporary_keyboard():
+    return types.ReplyKeyboardRemove()
+
+def screen_text(title, subtitle=None, body=None):
+    parts=[f"<b>{safe(title)}</b>"]
+    if subtitle: parts.append(f"<i>{safe(subtitle)}</i>")
+    if body: parts.append(body)
+    return "\\n\\n".join(parts)
 
 def home(uid):
     k=types.InlineKeyboardMarkup(row_width=2)
@@ -48,22 +53,38 @@ def home(uid):
         return db.get_setting('button.'+key+'.label',default)
     def enabled(key):
         return db.get_setting('button.'+key+'.enabled','1')=='1'
-    if enabled('shop'): k.add(types.InlineKeyboardButton(label('shop','🛒 خرید سرویس'),callback_data='shop'))
-    if enabled('profile'): k.add(types.InlineKeyboardButton(label('profile','👤 حساب من'),callback_data='profile'))
-    if enabled('orders'): k.add(types.InlineKeyboardButton(label('orders','📦 سرویس‌های من'),callback_data='orders'))
-    if enabled('deposit'): k.add(types.InlineKeyboardButton(label('deposit','💳 افزایش موجودی'),callback_data='deposit'))
-    if enabled('support'): k.add(types.InlineKeyboardButton(label('support','🎫 پشتیبانی'),callback_data='support'))
-    if enabled('gift'): k.add(types.InlineKeyboardButton(label('gift','🎁 کد هدیه'),callback_data='redeem_gift'))
-    if enabled('tutorials'): k.add(types.InlineKeyboardButton(label('tutorials','📚 آموزش اتصال'),callback_data='tutorials'))
-    if enabled('faq'): k.add(types.InlineKeyboardButton(label('faq','❓ سوالات متداول'),callback_data='faq'))
-    if feature('referral','0'): k.add(types.InlineKeyboardButton('💸 کسب درآمد / دعوت دوستان',callback_data='referral'))
-    if feature('dice_game','0'): k.add(types.InlineKeyboardButton('🎲 شانس و جایزه',callback_data='dice_game'))
+    # Primary actions first; secondary/help actions follow.
+    if enabled('shop'):
+        k.row(types.InlineKeyboardButton('🛒  خرید سرویس',callback_data='shop'))
+    primary=[
+        ('profile','👤 حساب من','profile'),
+        ('orders','📦 سرویس‌های من','orders'),
+        ('deposit','💳 افزایش موجودی','deposit'),
+        ('support','🎫 پشتیبانی','support'),
+        ('gift','🎁 کد هدیه','redeem_gift'),
+        ('tutorials','📚 آموزش اتصال','tutorials'),
+        ('faq','❔ راهنمای سوالات','faq'),
+    ]
+    row=[]
+    for key,default,callback in primary:
+        if enabled(key):
+            row.append(types.InlineKeyboardButton(label(key,default),callback_data=callback))
+            if len(row)==2:
+                k.row(*row);row=[]
+    if row:k.row(*row)
+    extras=[]
+    if feature('referral','0'):extras.append(types.InlineKeyboardButton('🤝 دعوت دوستان',callback_data='referral'))
+    if feature('dice_game','0'):extras.append(types.InlineKeyboardButton('🎲 جایزه و شانس',callback_data='dice_game'))
+    if extras:k.row(*extras)
     try:
-        for item in json.loads(db.get_setting('custom_buttons','[]'))[:8]:
+        custom=[]
+        for item in json.loads(db.get_setting('custom_buttons','[]'))[:6]:
             if item.get('label') and item.get('url','').startswith('https://'):
-                k.add(types.InlineKeyboardButton(item['label'][:50],url=item['url']))
-    except Exception: pass
-    if admin(uid):k.add(types.InlineKeyboardButton('⚙️ مدیریت SonarX',callback_data='admin'))
+                custom.append(types.InlineKeyboardButton(item['label'][:40],url=item['url']))
+        for i in range(0,len(custom),2):k.row(*custom[i:i+2])
+    except Exception:pass
+    if admin(uid):
+        k.row(types.InlineKeyboardButton('⚙️  مدیریت SonarX',callback_data='admin'))
     return k
 
 def blocked(uid):
@@ -73,17 +94,56 @@ def maintenance(uid):
         return True
     return False
 
-def admin_panel(chat_id):
-    k=types.InlineKeyboardMarkup(row_width=2)
-    buttons=[('📊 داشبورد','stats'),('📈 گزارش‌ها و برترین‌ها','reports'),('🧩 تنظیمات جامع','admin_config'),('🎚 قابلیت‌های ربات','feature_matrix:0'),
-      ('📦 پلن‌ها','admin_products'),('🗂 دسته‌بندی‌ها','categories'),('🖥 سرورها و پنل‌ها','admin_servers'),('🧾 رسیدهای معلق','admin_deposits'),('💰 بخش مالی','finance'),
-      ('👥 کاربران و جستجو','admin_users'),('➕ پلن جدید','add_product'),('➕ سرور جدید','add_server'),('💰 شارژ کاربر','credit'),
-      ('⛔ مسدودسازی','user_block'),('📢 پیام همگانی','broadcast'),('🎫 تیکت‌ها','admin_tickets'),('🛡 مدیران','admin_admins'),
-      ('🎟 کد تخفیف','discounts'),('🎁 کد هدیه اعتباری','gift_codes'),('🎲 قرعه‌کشی','lottery_admin'),('🤝 نمایندگان','resellers'),('📣 کانال‌ها','channels'),
-      ('🔘 مدیریت دکمه‌ها','button_manager'),('👥 ساخت گروهی اکانت','bulk_accounts'),('⚠️ سفارش‌های بررسی','admin_reviews'),
-      ('🧾 لاگ مدیریتی','audit'),('🔙 منوی کاربر','user_home')]
-    for label,cb in buttons:k.add(types.InlineKeyboardButton(label,callback_data=cb))
-    bot.send_message(chat_id,'<b>مرکز مدیریت SonarX</b>\nمدیریت فروش، مالی، کاربران، پنل‌ها و پشتیبانی.',reply_markup=k)
+ADMIN_SECTIONS={
+    'overview':('📊 گزارش و آمار',[
+        ('📊 داشبورد','stats'),('📈 گزارش‌ها و برترین‌ها','reports'),('🧾 لاگ مدیریتی','audit')]),
+    'catalog':('📦 فروشگاه و سرورها',[
+        ('📦 مدیریت پلن‌ها','admin_products'),('➕ پلن جدید','add_product'),
+        ('🗂 دسته‌بندی‌ها','categories'),('🖥 سرورها و پنل‌ها','admin_servers'),
+        ('➕ افزودن سرور','add_server'),('👥 ساخت گروهی اکانت','bulk_accounts')]),
+    'finance':('💰 مالی و پرداخت',[
+        ('💰 بخش مالی','finance'),('🧾 رسیدهای معلق','admin_deposits'),
+        ('💳 شارژ کاربر','credit'),('🎟 کدهای تخفیف','discounts'),
+        ('🎁 کدهای هدیه','gift_codes'),('🎲 قرعه‌کشی','lottery_admin')]),
+    'people':('👥 کاربران و نمایندگان',[
+        ('👥 کاربران و جستجو','admin_users'),('⛔ مسدودسازی','user_block'),
+        ('📢 پیام همگانی','broadcast'),('🛡 مدیران','admin_admins'),
+        ('🤝 نمایندگان','resellers'),('⚠️ سفارش‌های بررسی','admin_reviews')]),
+    'support':('🎫 پشتیبانی و ارتباط',[
+        ('🎫 مدیریت تیکت‌ها','admin_tickets'),('📣 کانال‌ها','channels')]),
+    'appearance':('🎨 ظاهر و دکمه‌ها',[
+        ('🔘 مدیریت دکمه‌ها','button_manager'),('🧩 متن‌ها و تنظیمات','admin_config')]),
+    'system':('🛠 تنظیمات سیستم',[
+        ('🎚 قابلیت‌های ربات','feature_matrix:0'),('🧩 تنظیمات جامع','admin_config')]),
+}
+
+def admin_panel(chat_id,message_id=None):
+    kb=types.InlineKeyboardMarkup(row_width=2)
+    for key,(title,_) in ADMIN_SECTIONS.items():
+        kb.add(types.InlineKeyboardButton(title,callback_data='admin_section:'+key))
+    kb.row(types.InlineKeyboardButton('↩️ بازگشت به منوی کاربر',callback_data='user_home'))
+    txt=screen_text('مرکز مدیریت SonarX','مدیریت متمرکز فروشگاه، کاربران، مالی و زیرساخت',
+                    '<i>یک بخش را برای مشاهده ابزارهای مربوط انتخاب کنید.</i>')
+    if message_id:
+        try:bot.edit_message_text(txt,chat_id,message_id,reply_markup=kb)
+        except Exception:bot.send_message(chat_id,txt,reply_markup=kb)
+    else:bot.send_message(chat_id,txt,reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c:c.data.startswith('admin_section:'))
+def admin_section(c):
+    if not admin(c.from_user.id):return bot.answer_callback_query(c.id,'دسترسی ندارید.',show_alert=True)
+    key=c.data.split(':',1)[1]
+    section=ADMIN_SECTIONS.get(key)
+    if not section:return bot.answer_callback_query(c.id,'بخش پیدا نشد.')
+    title,items=section
+    kb=types.InlineKeyboardMarkup(row_width=2)
+    for label,callback in items:
+        kb.add(types.InlineKeyboardButton(label,callback_data=callback))
+    kb.row(types.InlineKeyboardButton('⬅️ بازگشت به مدیریت',callback_data='admin'))
+    txt=screen_text(title,'ابزار موردنظر را انتخاب کنید.')
+    try:bot.edit_message_text(txt,c.message.chat.id,c.message.message_id,reply_markup=kb)
+    except Exception:bot.send_message(c.message.chat.id,txt,reply_markup=kb)
+    bot.answer_callback_query(c.id)
 
 @bot.message_handler(commands=['start'])
 def start(m):
@@ -100,21 +160,30 @@ def start(m):
         except Exception:log.exception('Referral attribution failed')
     if u.get('is_blocked') and not admin(m.from_user.id):return bot.send_message(m.chat.id,'حساب کاربری شما مسدود است.')
     welcome=text_setting('welcome','<b>به SonarX خوش آمدید</b>\nفروشگاه هوشمند سرویس‌های VPN؛ انتخاب پلن، پرداخت و تحویل خودکار.')
-    bot.send_message(m.chat.id,welcome,reply_markup=user_reply_keyboard(m.from_user.id))
-    bot.send_message(m.chat.id,'از منوی زیر استفاده کنید:',reply_markup=home(m.from_user.id))
+    u=db.get_user(m.from_user.id) or {}
+    balance=fmt(u.get('balance',0))
+    intro=welcome+'\\n\\n'+f'💳 موجودی حساب: <b>{balance}</b>\\n<i>برای شروع، یکی از گزینه‌های زیر را انتخاب کنید.</i>'
+    bot.send_message(m.chat.id,intro,reply_markup=home(m.from_user.id))
 
 @bot.message_handler(commands=['cancel'])
 def cancel(m):
-    states.pop(m.from_user.id,None);bot.send_message(m.chat.id,'عملیات لغو شد.',reply_markup=home(m.from_user.id))
+    states.pop(m.from_user.id,None)
+    bot.send_message(m.chat.id,'عملیات لغو شد.',reply_markup=remove_temporary_keyboard())
+    bot.send_message(m.chat.id,'به منوی اصلی برگشتید.',reply_markup=home(m.from_user.id))
 
 @bot.callback_query_handler(func=lambda c:c.data=='shop')
 def shop(c):
     if maintenance(c.from_user.id):return bot.answer_callback_query(c.id,'ربات در حال تعمیرات است.',show_alert=True)
     if not feature('shop_enabled'):return bot.answer_callback_query(c.id,'فروشگاه موقتاً غیرفعال است.',show_alert=True)
-    items=db.products();k=types.InlineKeyboardMarkup()
-    for p in items:k.add(types.InlineKeyboardButton(f"{p['name']} — {fmt(p['price'])}",callback_data=f"buy:{p['id']}"))
-    if not items:return bot.answer_callback_query(c.id,'فعلاً پلنی موجود نیست.',show_alert=True)
-    try:bot.edit_message_text('<b>فروشگاه SonarX</b>\n'+safe(text_setting('shop_notice','پلن موردنظر را انتخاب کنید:')),c.message.chat.id,c.message.message_id,reply_markup=k)
+    items=db.products();k=types.InlineKeyboardMarkup(row_width=1)
+    for p in items:
+        k.add(types.InlineKeyboardButton(f"📦 {p['name']}  ·  {fmt(p['price'])}",callback_data=f"buy:{p['id']}"))
+    k.add(types.InlineKeyboardButton('🏠 منوی اصلی',callback_data='user_home'))
+    if not items:
+        try:bot.edit_message_text('🛍 <b>فروشگاه موقتاً خالی است</b>\\nدر حال حاضر پلن فعالی برای فروش وجود ندارد. بعداً دوباره بررسی کنید.',c.message.chat.id,c.message.message_id,reply_markup=k)
+        except Exception:bot.send_message(c.message.chat.id,'🛍 <b>فروشگاه موقتاً خالی است</b>',reply_markup=k)
+        return
+    try:bot.edit_message_text('🛍 <b>فروشگاه SonarX</b>\\n'+safe(text_setting('shop_notice','پلن مناسب خود را انتخاب کنید.'))+'\\n\\n<i>برای مشاهده جزئیات، پلن را انتخاب کنید.</i>',c.message.chat.id,c.message.message_id,reply_markup=k)
     except Exception:bot.send_message(c.message.chat.id,'<b>فروشگاه SonarX</b>',reply_markup=k)
 
 @bot.callback_query_handler(func=lambda c:c.data.startswith('buy:'))
@@ -123,53 +192,76 @@ def buy(c):
     p=db.product(int(c.data.split(':')[1]))
     if not p:return bot.answer_callback_query(c.id,'پلن در دسترس نیست.',show_alert=True)
     k=types.InlineKeyboardMarkup(row_width=2)
-    k.add(types.InlineKeyboardButton('تأیید خرید',callback_data=f"confirm:{p['id']}"),types.InlineKeyboardButton('🎟 اعمال تخفیف',callback_data=f"discount_apply:{p['id']}"))
-    k.add(types.InlineKeyboardButton('بازگشت','shop'))
-    bot.edit_message_text(f"<b>{safe(p['name'])}</b>\n{safe(p['description'])}\nحجم: {p['traffic_gb']} GB | اعتبار: {p['days'] or 'نامحدود'} روز\nقیمت: <b>{fmt(p['price'])}</b>",c.message.chat.id,c.message.message_id,reply_markup=k)
+    k.row(types.InlineKeyboardButton('ادامه و بررسی سفارش',callback_data=f"purchase_review:{p['id']}"))
+    k.row(types.InlineKeyboardButton('🎟 اعمال کد تخفیف',callback_data=f"discount_apply:{p['id']}"),
+          types.InlineKeyboardButton('↩️ بازگشت به پلن‌ها',callback_data='shop'))
+    details=(f"<b>{safe(p['name'])}</b>\\n{safe(p['description'])}\\n\\n"
+             f"📦 حجم: <b>{p['traffic_gb']} GB</b>\\n"
+             f"🗓 اعتبار: <b>{p['days'] or 'نامحدود'} روز</b>\\n"
+             f"💰 قیمت: <b>{fmt(p['price'])}</b>\\n\\n"
+             "<i>برای خرید، ابتدا سفارش را بررسی کنید.</i>")
+    bot.edit_message_text(details,c.message.chat.id,c.message.message_id,reply_markup=k)
 
 @bot.callback_query_handler(func=lambda c:c.data.startswith('discount_apply:'))
 def discount_apply_start(c):
     if maintenance(c.from_user.id):return bot.answer_callback_query(c.id,'ربات در حال تعمیرات است.',show_alert=True)
     if not feature('discounts','1'):return bot.answer_callback_query(c.id,'کد تخفیف غیرفعال است.',show_alert=True)
     pid=int(c.data.split(':')[1]);states[c.from_user.id]={'step':'discount_input','product_id':pid}
-    bot.send_message(c.message.chat.id,'کد تخفیف را ارسال کنید. /cancel برای لغو.')
+    try:bot.edit_message_text('🎟 <b>اعمال کد تخفیف</b>\\nکد تخفیف را در پیام بعدی ارسال کنید.\\nبرای لغو از /cancel استفاده کنید.',c.message.chat.id,c.message.message_id,reply_markup=None)
+    except Exception:pass
+    bot.send_message(c.message.chat.id,'منتظر دریافت کد تخفیف هستم.')
 
 @bot.message_handler(func=lambda m:states.get(m.from_user.id,{}).get('step')=='discount_input')
 def discount_input(m):
     st=states.get(m.from_user.id,{})
     code=(m.text or '').strip().upper();d=db.get_discount(code)
     if not d:return bot.send_message(m.chat.id,'کد تخفیف معتبر یا فعال نیست. دوباره تلاش کنید.')
-    st['discount_code']=code;st['step']=''
+    st['discount_code']=code
     p=db.product(st['product_id'])
-    if not p:return bot.send_message(m.chat.id,'پلن پیدا نشد.')
+    if not p:
+        states.pop(m.from_user.id,None)
+        return bot.send_message(m.chat.id,'پلن پیدا نشد.',reply_markup=remove_temporary_keyboard())
     price=int(p['price']*(100-d['percent'])/100)
-    bot.send_message(m.chat.id,f"کد {safe(code)} اعمال شد. تخفیف: {d['percent']}٪\nقیمت نهایی: <b>{fmt(price)}</b>",reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('تأیید خرید',callback_data=f"confirm:{p['id']}"),types.InlineKeyboardButton('بازگشت','shop')))
+    st['step']='purchase_confirm'
+    summary=(f"🎟 کد <b>{safe(code)}</b> اعمال شد\\n"
+             f"میزان تخفیف: <b>{d['percent']}٪</b>\\n"
+             f"مبلغ نهایی: <b>{fmt(price)}</b>\\n\\n"
+             "برای ثبت قطعی سفارش، از کیبورد تلگرام استفاده کنید.")
+    bot.send_message(m.chat.id,summary,reply_markup=temporary_action_keyboard('✅ تأیید نهایی','↩️ بازگشت به پلن‌ها'))
 
-@bot.callback_query_handler(func=lambda c:c.data.startswith('confirm:'))
-def confirm(c):
-    if maintenance(c.from_user.id):return bot.answer_callback_query(c.id,'ربات در حال تعمیرات است.',show_alert=True)
-    p=db.product(int(c.data.split(':')[1]))
-    if not p:return bot.answer_callback_query(c.id,'پلن پیدا نشد.',show_alert=True)
-    discount_code=states.get(c.from_user.id,{}).get('discount_code')
+def shop_keyboard():
+    kb=types.InlineKeyboardMarkup(row_width=1)
+    for product in db.products():
+        kb.add(types.InlineKeyboardButton(f"{product['name']} · {fmt(product['price'])}",callback_data=f"buy:{product['id']}"))
+    kb.add(types.InlineKeyboardButton('🏠 منوی اصلی',callback_data='user_home'))
+    return kb
+
+def run_purchase(uid,chat_id,pid):
+    if maintenance(uid):
+        return bot.send_message(chat_id,'فروشگاه در حال حاضر در دسترس نیست.')
+    p=db.product(int(pid))
+    if not p:
+        return bot.send_message(chat_id,'پلن پیدا نشد.')
+    discount_code=states.get(uid,{}).get('discount_code')
     reserved=False
     if discount_code:
         percent=db.reserve_discount(discount_code)
         if percent is None:
-            states.pop(c.from_user.id,None)
-            return bot.answer_callback_query(c.id,'کد تخفیف تمام شده یا غیرفعال است.',show_alert=True)
+            states.pop(uid,None)
+            return bot.send_message(chat_id,'کد تخفیف تمام شده یا غیرفعال است.')
         p=dict(p);p['price']=int(p['price']*(100-percent)/100);reserved=True
-    try:oid=db.begin_order(c.from_user.id,p)
+    try:oid=db.begin_order(uid,p)
     except Exception as exc:
         if reserved:db.release_discount(discount_code)
-        return bot.answer_callback_query(c.id,str(exc),show_alert=True)
-    states.pop(c.from_user.id,None)
-    bot.answer_callback_query(c.id,'سفارش ثبت شد؛ در حال ساخت سرویس…')
-    bot.send_message(c.message.chat.id,'⏳ سفارش شما در حال پردازش است.')
+        return bot.send_message(chat_id,'ثبت سفارش انجام نشد: '+safe(exc))
+    states.pop(uid,None)
+
+    bot.send_message(chat_id,'⏳ سفارش شما در حال پردازش است.')
     servers=db.servers()
     if not servers:
         db.fail_order_refund(oid,'No active PasarGuard server')
         if reserved: db.release_discount(discount_code)
-        return bot.send_message(c.message.chat.id,'سرور فعالی تنظیم نشده است؛ مبلغ به کیف پول برگشت خورد.',reply_markup=home(c.from_user.id))
+        return bot.send_message(chat_id,'سرور فعالی تنظیم نشده است؛ مبلغ به کیف پول برگشت خورد.',reply_markup=home(uid))
     # Authenticate candidate servers first. Once a create POST is attempted, do not fail over blindly.
     selected=None;errors=[]
     for server in servers:
@@ -179,33 +271,66 @@ def confirm(c):
     if not selected:
         db.fail_order_refund(oid,'Panel login failed: '+'; '.join(errors))
         if reserved: db.release_discount(discount_code)
-        return bot.send_message(c.message.chat.id,'اتصال به هیچ سرور فعالی موفق نبود؛ مبلغ برگشت داده شد.',reply_markup=home(c.from_user.id))
-    server,client=selected;username=f"sx{c.from_user.id}_{secrets.token_hex(4)}"
+        return bot.send_message(chat_id,'اتصال به هیچ سرور فعالی موفق نبود؛ مبلغ برگشت داده شد.',reply_markup=home(uid))
+    server,client=selected;username=f"sx{uid}_{secrets.token_hex(4)}"
     try:
         groups=json.loads(p['group_ids'] or '[]')
         result,sub=client.create_user(username,p['traffic_gb'],p['days'],groups,note=f'SonarX order {oid}')
     except PasarGuardError as exc:
         if exc.uncertain:
             db.mark_order_review(oid,str(exc));
-            bot.send_message(c.message.chat.id,f'⚠️ نتیجه ساخت سرویس قطعی نیست؛ مبلغ محفوظ است و مدیر بررسی می‌کند. شناسه: <code>{oid[:8]}</code>')
+            bot.send_message(chat_id,f'⚠️ نتیجه ساخت سرویس قطعی نیست؛ مبلغ محفوظ است و مدیر بررسی می‌کند. شناسه: <code>{oid[:8]}</code>')
             for aid in settings.admin_ids:
                 try:bot.send_message(aid,f'سفارش نیازمند بررسی: {oid}\nسرور: {safe(server["name"])}\nکاربر پنل: {safe(username)}\n{safe(exc)}')
                 except Exception:pass
         else:
             db.fail_order_refund(oid,str(exc))
             if reserved: db.release_discount(discount_code)
-            bot.send_message(c.message.chat.id,'ساخت سرویس ناموفق بود؛ مبلغ به کیف پول برگشت خورد.')
+            bot.send_message(chat_id,'ساخت سرویس ناموفق بود؛ مبلغ به کیف پول برگشت خورد.')
         return
     except Exception as exc:
         db.mark_order_review(oid,f'Unexpected panel error; check panel before refund: {exc}')
         log.exception('Uncertain PasarGuard create result')
-        bot.send_message(c.message.chat.id,'⚠️ نتیجه ساخت سرویس نامشخص است؛ مبلغ محفوظ است و سفارش برای بررسی مدیر ثبت شد.')
+        bot.send_message(chat_id,'⚠️ نتیجه ساخت سرویس نامشخص است؛ مبلغ محفوظ است و سفارش برای بررسی مدیر ثبت شد.')
         return
     try:db.finish_order(oid,server['id'],username,sub)
     except Exception as exc:
         db.mark_order_review(oid,f'Panel user created; DB finalization failed: {exc}')
-        log.exception('Order finalization failed');return bot.send_message(c.message.chat.id,'اکانت احتمالاً در پنل ساخته شده؛ ثبت دیتابیس نیازمند بررسی مدیر است و مبلغ محفوظ ماند.')
-    bot.send_message(c.message.chat.id,f'✅ <b>سرویس شما ساخته شد</b>\nنام کاربری: <code>{safe(username)}</code>\nلینک اشتراک:\n<code>{safe(sub)}</code>\nشناسه سفارش: <code>{oid[:8]}</code>',reply_markup=home(c.from_user.id))
+        log.exception('Order finalization failed');return bot.send_message(chat_id,'اکانت احتمالاً در پنل ساخته شده؛ ثبت دیتابیس نیازمند بررسی مدیر است و مبلغ محفوظ ماند.')
+    bot.send_message(chat_id,f'✅ <b>سرویس شما ساخته شد</b>\nنام کاربری: <code>{safe(username)}</code>\nلینک اشتراک:\n<code>{safe(sub)}</code>\nشناسه سفارش: <code>{oid[:8]}</code>',reply_markup=home(uid))
+
+@bot.callback_query_handler(func=lambda c:c.data.startswith('purchase_review:'))
+def purchase_review(c):
+    pid=int(c.data.split(':')[1])
+    p=db.product(pid)
+    if not p:return bot.answer_callback_query(c.id,'پلن پیدا نشد.',show_alert=True)
+    states[c.from_user.id]={'step':'purchase_confirm','product_id':pid}
+    try:
+        bot.edit_message_text(
+            f"🧾 <b>بررسی نهایی سفارش</b>\\nپلن: <b>{safe(p['name'])}</b>\\nحجم: {p['traffic_gb']} GB\\nاعتبار: {p['days'] or 'نامحدود'} روز\\nمبلغ: <b>{fmt(p['price'])}</b>\\n\\nبا انتخاب «تأیید نهایی»، سفارش ثبت و مبلغ از کیف پول کسر می‌شود.",
+            c.message.chat.id,c.message.message_id,reply_markup=None)
+    except Exception:pass
+    bot.send_message(c.message.chat.id,'یکی از گزینه‌های زیر را انتخاب کنید:',reply_markup=temporary_action_keyboard('✅ تأیید نهایی','↩️ بازگشت به پلن‌ها'))
+    bot.answer_callback_query(c.id)
+
+@bot.message_handler(func=lambda m:states.get(m.from_user.id,{}).get('step')=='purchase_confirm')
+def purchase_confirm_message(m):
+    st=states.get(m.from_user.id,{})
+    if m.text=='↩️ بازگشت به پلن‌ها':
+        states.pop(m.from_user.id,None)
+        bot.send_message(m.chat.id,'سفارش لغو شد؛ می‌توانید پلن دیگری انتخاب کنید.',reply_markup=remove_temporary_keyboard())
+        return bot.send_message(m.chat.id,'فروشگاه پلن‌ها:',reply_markup=shop_keyboard())
+    if m.text!='✅ تأیید نهایی':
+        return bot.send_message(m.chat.id,'لطفاً از دکمه‌های کیبورد برای تأیید یا بازگشت استفاده کنید.')
+    pid=st.get('product_id')
+    bot.send_message(m.chat.id,'در حال ثبت سفارش...',reply_markup=remove_temporary_keyboard())
+    return run_purchase(m.from_user.id,m.chat.id,pid)
+
+@bot.callback_query_handler(func=lambda c:c.data.startswith('confirm:'))
+def confirm(c):
+    pid=int(c.data.split(':')[1])
+    bot.answer_callback_query(c.id,'در حال ثبت سفارش...')
+    return run_purchase(c.from_user.id,c.message.chat.id,pid)
 
 @bot.callback_query_handler(func=lambda c:c.data.startswith('service_addon:'))
 def service_addon_start(c):
@@ -269,24 +394,46 @@ def service_addon_apply(m):
 def profile(c):
     u=db.get_user(c.from_user.id)
     if not u:return
-    bot.send_message(c.message.chat.id,f"<b>حساب کاربری</b>\nشناسه: <code>{u['id']}</code>\nموجودی: <b>{fmt(u['balance'])}</b>\nوضعیت: {'مسدود' if u['is_blocked'] else 'فعال'}",reply_markup=home(c.from_user.id))
+    kb=types.InlineKeyboardMarkup(row_width=2)
+    kb.row(types.InlineKeyboardButton('💳 افزایش موجودی',callback_data='deposit'),
+           types.InlineKeyboardButton('📦 سرویس‌های من',callback_data='orders'))
+    kb.row(types.InlineKeyboardButton('🏠 منوی اصلی',callback_data='user_home'))
+    bot.send_message(c.message.chat.id,
+        f"👤 <b>حساب کاربری من</b>\\n━━━━━━━━━━━━━━\\n"
+        f"شناسه: <code>{u['id']}</code>\\n"
+        f"موجودی کیف پول: <b>{fmt(u['balance'])}</b>\\n"
+        f"وضعیت حساب: <b>{'مسدود' if u['is_blocked'] else 'فعال'}</b>",
+        reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c:c.data=='orders')
 def orders(c):
     rows=db.services_for(c.from_user.id)
     if rows:
         for s in rows:
-            msg=f"<b>{safe(s['product_name'])}</b>\nسرور: {safe(s['server_name'])}\nوضعیت: {safe(s['status'])}\nمصرف: {s['used_bytes']/1024**3:.2f} / {s['data_limit_bytes']/1024**3:.2f} GB"
-            if s['expires_at']:msg+=f"\nانقضا: {safe(s['expires_at'])}"
-            if s['subscription_url']:msg+=f"\nاشتراک: <code>{safe(s['subscription_url'])}</code>"
+            limit=int(s['data_limit_bytes'] or 0);used=int(s['used_bytes'] or 0)
+            status_label={'active':'فعال','expired':'منقضی','disabled':'غیرفعال'}.get(s['status'],safe(s['status']))
+            msg=(f"📦 <b>{safe(s['product_name'])}</b>\\n"
+                 f"━━━━━━━━━━━━━━\\n"
+                 f"🖥 سرور: <b>{safe(s['server_name'])}</b>\\n"
+                 f"🟢 وضعیت: <b>{status_label}</b>\\n"
+                 f"📊 مصرف: <code>{used/1024**3:.2f} / {limit/1024**3:.2f} GB</code>\\n"
+                 f"<code>{usage_bar(used,limit)}</code>")
+            if s['expires_at']:msg+=f"\\n🗓 انقضا: <b>{safe(s['expires_at'])}</b>"
+            if s['subscription_url']:msg+=f"\\n\\n🔗 لینک اشتراک:\\n<code>{safe(s['subscription_url'])}</code>"
             kb=types.InlineKeyboardMarkup(row_width=2)
-            if feature('increase_volume','0'): kb.add(types.InlineKeyboardButton('➕ افزایش حجم',callback_data=f'service_addon:gb:{s["id"]}'))
-            if feature('renew_service','0'): kb.add(types.InlineKeyboardButton('🗓 تمدید زمان',callback_data=f'service_addon:days:{s["id"]}'))
-            bot.send_message(c.message.chat.id,msg,reply_markup=kb if kb.keyboard else None)
+            actions=[]
+            if feature('increase_volume','0'):actions.append(types.InlineKeyboardButton('➕ افزایش حجم',callback_data=f'service_addon:gb:{s["id"]}'))
+            if feature('renew_service','0'):actions.append(types.InlineKeyboardButton('🗓 تمدید زمان',callback_data=f'service_addon:days:{s["id"]}'))
+            if actions:kb.row(*actions)
+            kb.row(types.InlineKeyboardButton('🏠 منوی اصلی',callback_data='user_home'))
+            bot.send_message(c.message.chat.id,msg,reply_markup=kb)
     else:
-        rows=db.orders_for(c.from_user.id)
-        if not rows:return bot.send_message(c.message.chat.id,'هنوز سرویسی ندارید.',reply_markup=home(c.from_user.id))
-        for o in rows:bot.send_message(c.message.chat.id,f"سفارش <code>{o['id'][:8]}</code> — {safe(o['product_name'])}\nوضعیت: {safe(o['status'])}")
+        orders_rows=db.orders_for(c.from_user.id)
+        if not orders_rows:
+            return bot.send_message(c.message.chat.id,'📭 <b>هنوز سرویسی ندارید</b>\\nبعد از خرید، اطلاعات سرویس در همین بخش نمایش داده می‌شود.',reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🛒 مشاهده پلن‌ها',callback_data='shop'),types.InlineKeyboardButton('🏠 منوی اصلی',callback_data='user_home')))
+        kb=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🏠 منوی اصلی',callback_data='user_home'))
+        for o in orders_rows:
+            bot.send_message(c.message.chat.id,f"🧾 سفارش <code>{o['id'][:8]}</code>\\n{safe(o['product_name'])}\\nوضعیت: <b>{safe(o['status'])}</b>",reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c:c.data=='deposit')
 def deposit(c):
@@ -344,12 +491,23 @@ def ticket_body(m):
 @bot.callback_query_handler(func=lambda c:c.data=='admin')
 def admin_entry(c):
     if not admin(c.from_user.id):return
-    admin_panel(c.message.chat.id)
+    admin_panel(c.message.chat.id,c.message.message_id)
 
 @bot.callback_query_handler(func=lambda c:c.data=='stats')
 def stats(c):
     if not admin(c.from_user.id):return
-    s=db.stats();bot.send_message(c.message.chat.id,f"<b>داشبورد SonarX</b>\nکاربران: {s['users']}\nسفارش موفق: {s['orders']}\nفروش ثبت‌شده: {fmt(s['revenue'])}\nرسیدهای معلق: {s['pending_deposits']}\nتیکت‌های باز: {s['open_tickets']}")
+    s=db.stats()
+    txt=(f"📊 <b>داشبورد SonarX</b>\\n━━━━━━━━━━━━━━\\n"
+         f"👥 کاربران: <b>{s['users']:,}</b>\\n"
+         f"🛒 سفارش‌های موفق: <b>{s['orders']:,}</b>\\n"
+         f"💰 فروش ثبت‌شده: <b>{fmt(s['revenue'])}</b>\\n"
+         f"🧾 رسیدهای در انتظار: <b>{s['pending_deposits']:,}</b>\\n"
+         f"🎫 تیکت‌های باز: <b>{s['open_tickets']:,}</b>")
+    kb=types.InlineKeyboardMarkup(row_width=2)
+    kb.row(types.InlineKeyboardButton('📈 گزارش تفصیلی',callback_data='reports'),
+           types.InlineKeyboardButton('🧾 لاگ مدیریتی',callback_data='audit'))
+    kb.row(types.InlineKeyboardButton('⬅️ مرکز مدیریت',callback_data='admin'))
+    bot.send_message(c.message.chat.id,txt,reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c:c.data=='admin_config')
 def admin_config(c):
@@ -381,9 +539,10 @@ def admin_products(c):
     if not admin(c.from_user.id):return
     k=types.InlineKeyboardMarkup()
     for p in db.products_admin():
-        k.add(types.InlineKeyboardButton(f"{p['name']} — {'فعال' if p['active'] else 'غیرفعال'}",callback_data=f"ptoggle:{p['id']}"))
-        k.add(types.InlineKeyboardButton(f"✏️ تغییر قیمت {p['name']} ({fmt(p['price'])})",callback_data=f"pprice:{p['id']}"))
-    bot.send_message(c.message.chat.id,'برای تغییر وضعیت پلن انتخاب کنید:',reply_markup=k)
+        k.add(types.InlineKeyboardButton(f"{'🟢' if p['active'] else '🔴'} {p['name']} · {'فعال' if p['active'] else 'غیرفعال'}",callback_data=f"ptoggle:{p['id']}"))
+        k.add(types.InlineKeyboardButton(f"✏️ قیمت {p['name']} · {fmt(p['price'])}",callback_data=f"pprice:{p['id']}"))
+    k.add(types.InlineKeyboardButton('⬅️ مرکز مدیریت',callback_data='admin'))
+    bot.send_message(c.message.chat.id,'📦 <b>مدیریت پلن‌ها</b>\\nبرای تغییر وضعیت یا قیمت، پلن را انتخاب کنید.',reply_markup=k)
 
 @bot.callback_query_handler(func=lambda c:c.data.startswith('pprice:'))
 def product_price_start(c):
@@ -658,26 +817,6 @@ def feature_toggle(c):
     bot.answer_callback_query(c.id,'تنظیم ذخیره شد.')
     _feature_page(c.message.chat.id,int(page),c.message.message_id)
 
-@bot.message_handler(func=lambda m:m.text in {'🛒 خرید سرویس','👤 حساب من','📦 سرویس‌های من','💳 افزایش موجودی','🎫 پشتیبانی','🎟 تیکت‌های من','🎁 کد هدیه','🎲 شانس و جایزه','📚 آموزش اتصال','❓ سوالات متداول','⚙️ پنل مدیریت'})
-def reply_menu_router(m):
-    t=m.text
-    if t=='🛒 خرید سرویس': return bot.send_message(m.chat.id,'فروشگاه:',reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('نمایش پلن‌ها',callback_data='shop')))
-    if t=='👤 حساب من':
-        u=db.get_user(m.from_user.id)
-        if u:return bot.send_message(m.chat.id,f"<b>حساب کاربری</b>\nشناسه: <code>{u['id']}</code>\nموجودی: <b>{fmt(u['balance'])}</b>",reply_markup=home(m.from_user.id))
-    if t=='📦 سرویس‌های من': return bot.send_message(m.chat.id,'سرویس‌های شما:',reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('مشاهده سرویس‌ها',callback_data='orders')))
-    if t=='💳 افزایش موجودی': return bot.send_message(m.chat.id,'افزایش موجودی:',reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('ثبت درخواست شارژ',callback_data='deposit')))
-    if t=='🎫 پشتیبانی': return bot.send_message(m.chat.id,'پشتیبانی:',reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('ثبت تیکت',callback_data='support')))
-    if t=='🎟 تیکت‌های من': return bot.send_message(m.chat.id,'تیکت‌های من:',reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('نمایش تیکت‌ها',callback_data='my_tickets')))
-    if t=='🎲 شانس و جایزه': return bot.send_message(m.chat.id,'بازی تاس:',reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('پرتاب تاس',callback_data='dice_game')))
-    if t=='🎁 کد هدیه':
-        states[m.from_user.id]={'step':'gift_redeem'}
-        return bot.send_message(m.chat.id,'کد هدیه را ارسال کنید. /cancel برای لغو.')
-    if t=='📚 آموزش اتصال': return bot.send_message(m.chat.id,'آموزش:',reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('مشاهده آموزش',callback_data='tutorials')))
-    if t=='❓ سوالات متداول': return bot.send_message(m.chat.id,'سوالات متداول:',reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('مشاهده سوالات',callback_data='faq')))
-    if t=='⚙️ پنل مدیریت':
-        if admin(m.from_user.id): return admin_panel(m.chat.id)
-
 @bot.message_handler(commands=['panel'])
 def admin_shortcut(m):
     if admin(m.from_user.id): admin_panel(m.chat.id)
@@ -714,8 +853,8 @@ def faq(c):
 
 @bot.callback_query_handler(func=lambda c:c.data=='user_home')
 def user_home(c):
-    bot.send_message(c.message.chat.id,'منوی کاربری:',reply_markup=user_reply_keyboard(c.from_user.id))
-    bot.send_message(c.message.chat.id,'انتخاب کنید:',reply_markup=home(c.from_user.id))
+    try:bot.edit_message_text('🏠 <b>منوی اصلی SonarX</b>\\nخدمات موردنظر را انتخاب کنید.',c.message.chat.id,c.message.message_id,reply_markup=home(c.from_user.id))
+    except Exception:bot.send_message(c.message.chat.id,'🏠 <b>منوی اصلی SonarX</b>\\nخدمات موردنظر را انتخاب کنید.',reply_markup=home(c.from_user.id))
 
 @bot.callback_query_handler(func=lambda c:c.data=='referral')
 def referral(c):
@@ -773,6 +912,7 @@ def finance(c):
     kb=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('تنظیم راهنمای پرداخت',callback_data='edittext:payment'))
     kb.add(types.InlineKeyboardButton('تنظیم قیمت تمدید/حجم',callback_data='addon_prices'))
     kb.add(types.InlineKeyboardButton('رسیدهای معلق',callback_data='admin_deposits'))
+    kb.add(types.InlineKeyboardButton('⬅️ مرکز مدیریت',callback_data='admin'))
     bot.send_message(c.message.chat.id,safe(txt),reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c:c.data=='lottery_draw')
@@ -796,7 +936,8 @@ def categories_admin(c):
     for x in rows: kb.add(types.InlineKeyboardButton('🗂 '+x['name'],callback_data=f'catdel:{x["id"]}'))
     kb.add(types.InlineKeyboardButton('➕ افزودن دسته',callback_data='catadd'))
     kb.add(types.InlineKeyboardButton('بازگشت',callback_data='admin'))
-    bot.send_message(c.message.chat.id,'دسته‌ها (برای حذف انتخاب کنید):',reply_markup=kb)
+    kb.add(types.InlineKeyboardButton('⬅️ مرکز مدیریت',callback_data='admin'))
+    bot.send_message(c.message.chat.id,'🗂 <b>مدیریت دسته‌بندی‌ها</b>\\nبرای ویرایش یا حذف، یک دسته را انتخاب کنید.',reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c:c.data=='catadd')
 def category_add(c):
@@ -815,7 +956,8 @@ def discounts_admin(c):
     rows=db.discounts();kb=types.InlineKeyboardMarkup(row_width=1)
     for x in rows: kb.add(types.InlineKeyboardButton(f"{x['code']} — {x['percent']}% — {'فعال' if x['active'] else 'خاموش'}",callback_data=f'discount_toggle:{x["code"]}'))
     kb.add(types.InlineKeyboardButton('➕ ساخت کد تخفیف',callback_data='discount_add'))
-    bot.send_message(c.message.chat.id,'مدیریت کدهای تخفیف:',reply_markup=kb)
+    kb.add(types.InlineKeyboardButton('⬅️ مرکز مدیریت',callback_data='admin'))
+    bot.send_message(c.message.chat.id,'🎟 <b>کدهای تخفیف</b>\\nکد موردنظر را انتخاب کنید یا کد تازه بسازید.',reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c:c.data=='discount_add')
 def discount_add(c):
@@ -875,19 +1017,20 @@ def channel_add(c):
 @bot.callback_query_handler(func=lambda c:c.data=='button_manager')
 def button_manager(c):
     if not admin(c.from_user.id): return
-    kb=types.InlineKeyboardMarkup(row_width=1)
+    kb=types.InlineKeyboardMarkup(row_width=2)
     keys=[('shop','خرید سرویس'),('profile','مشخصات کاربری'),('orders','سرویس‌های من'),('deposit','شارژ کیف پول'),('support','تیکت پشتیبانی'),('gift','کد هدیه'),('tutorials','آموزش'),('faq','سوالات متداول')]
     for key,label in keys:
         state=db.get_setting('button.'+key+'.enabled','1')
-        kb.add(types.InlineKeyboardButton(f"{'🟢' if state=='1' else '🔴'} {label}",callback_data=f'button_toggle:{key}'))
-        kb.add(types.InlineKeyboardButton('✏️ ویرایش متن '+label,callback_data=f'button_edit:{key}'))
+        kb.row(types.InlineKeyboardButton(f"{'🟢' if state=='1' else '🔴'} {label}",callback_data=f'button_toggle:{key}'),
+               types.InlineKeyboardButton('✏️ ویرایش',callback_data=f'button_edit:{key}'))
     try:
         custom=json.loads(db.get_setting('custom_buttons','[]'))
         for i,item in enumerate(custom[:8]):
             kb.add(types.InlineKeyboardButton('🗑 حذف '+item.get('label','دکمه')[:30],callback_data=f'button_delete:{i}'))
     except Exception: pass
     kb.add(types.InlineKeyboardButton('➕ افزودن دکمه لینک‌دار',callback_data='button_add'))
-    bot.send_message(c.message.chat.id,'وضعیت و متن دکمه‌ها؛ لینک‌های سفارشی نیز قابل افزودن هستند.',reply_markup=kb)
+    kb.add(types.InlineKeyboardButton('⬅️ مرکز مدیریت',callback_data='admin'))
+    bot.send_message(c.message.chat.id,'🔘 <b>مدیریت دکمه‌های صفحه اصلی</b>\\nوضعیت و عنوان هر گزینه را تغییر دهید. لینک‌های اختصاصی نیز قابل افزودن هستند.',reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c:c.data.startswith('button_toggle:'))
 def button_toggle(c):
@@ -931,7 +1074,8 @@ def reports(c):
     txt+='\n\n<b>بیشترین سرویس فعال</b>\n'+'\n'.join(f"{x['id']} — {x['active_services']}" for x in active)
     txt+='\n\n<b>بیشترین موجودی کیف پول</b>\n'+'\n'.join(f"{x['id']} — {fmt(x['balance'])}" for x in top)
     txt+='\n\n<b>آخرین رویدادها</b>\n'+'\n'.join(f"{x['created_at']} | {x['actor_id']} | {x['action']}" for x in aud)
-    bot.send_message(c.message.chat.id,safe(txt))
+    kb=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('⬅️ مرکز مدیریت',callback_data='admin'))
+    bot.send_message(c.message.chat.id,safe(txt),reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c:c.data=='audit')
 def audit(c):
@@ -1047,7 +1191,7 @@ def advanced_admin_input(m):
 
 @bot.message_handler(commands=['help'])
 def help_command(m):
-    bot.send_message(m.chat.id,'دستورات:\n/start منوی کاربر\n/panel پنل مدیریت\n/cancel لغو عملیات\nبرای مدیریت سرور از پنل داخل ربات استفاده کنید.',reply_markup=user_reply_keyboard(m.from_user.id))
+    bot.send_message(m.chat.id,'دستورات:\n/start منوی کاربر\n/panel پنل مدیریت\n/cancel لغو عملیات\nبرای مدیریت سرور از پنل داخل ربات استفاده کنید.',reply_markup=home(m.from_user.id))
 
 def main():
     log.info('SonarX starting; backend=%s',db.backend)
