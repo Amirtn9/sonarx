@@ -14,13 +14,16 @@ class PasarGuardClient:
     def _request(self,method,path,**kwargs):
         try: r=self.session.request(method,self.url+path,timeout=self.timeout,verify=self.verify_tls,**kwargs)
         except (requests.Timeout,requests.ConnectionError) as exc: raise
+        mutation = method.upper() == 'PUT' or (
+            method.upper() == 'POST' and path in {'/api/user', '/api/users'}
+        )
         if r.status_code>=400:
             try: detail=r.json()
             except ValueError: detail=r.text[:500]
-            raise PasarGuardError(f'PasarGuard API {r.status_code}: {detail}',uncertain=(method.upper() in {'POST','PUT'} and r.status_code>=500))
+            raise PasarGuardError(f'PasarGuard API {r.status_code}: {detail}',uncertain=(mutation and r.status_code>=500))
         if not r.content:return {}
         try:return r.json()
-        except ValueError:raise PasarGuardError('پاسخ پنل JSON معتبر نیست.',uncertain=method.upper()=='POST')
+        except ValueError:raise PasarGuardError('پاسخ پنل JSON معتبر نیست.',uncertain=mutation)
     def login(self):
         data=self._request('POST','/api/admin/token',data={'username':self.username,'password':self.password},headers={'Content-Type':'application/x-www-form-urlencoded'})
         token=data.get('access_token')
@@ -43,6 +46,9 @@ class PasarGuardClient:
         sub=data.get('subscription_url') or data.get('subscription_link') or data.get('sub_url') or data.get('subscription') or data.get('links')
         if isinstance(sub,list):sub='\n'.join(map(str,sub))
         return sub
+    def subscription_url(self, data, username=None):
+        """Return the subscription URL exposed by the panel response."""
+        return self._sub(data)
     def create_user(self,username,traffic_gb,days,group_ids=None,note='SonarX order'):
         self.ensure_login()
         expires=0 if not days else datetime.now(timezone.utc).timestamp()+days*86400
@@ -54,16 +60,27 @@ class PasarGuardClient:
             result=self._post_with_auth_retry('/api/user',payload)
         except (requests.Timeout,requests.ConnectionError) as exc:
             # The panel may have committed the POST. Reconcile by username; never POST to another panel blindly.
-            try: result=self._request('GET',f'/api/user/{quote(username,safe="")}')
+            try: result=self._get_with_auth_retry(f'/api/user/{quote(username,safe="")}')
             except Exception as check_exc: raise PasarGuardError('نتیجه ساخت اکانت پس از قطع ارتباط نامشخص است؛ نیازمند بررسی پنل.',True) from check_exc
         sub=self._sub(result)
         if not sub:
-            try: sub=self._sub(self._request('GET',f'/api/user/{quote(username,safe="")}'))
+            try: sub=self._sub(self._get_with_auth_retry(f'/api/user/{quote(username,safe="")}'))
             except Exception: pass
         if not sub:raise PasarGuardError('پاسخ پنل لینک اشتراک ندارد؛ وضعیت اکانت باید دستی بررسی شود.',True)
         return result,sub
+    def _get_with_auth_retry(self, path):
+        self.ensure_login()
+        try:
+            return self._request('GET', path)
+        except PasarGuardError as exc:
+            if '401' not in str(exc) or exc.uncertain:
+                raise
+            self._token = None
+            self.login()
+            return self._request('GET', path)
+
     def get_user(self,username):
-        self.ensure_login(); return self._request('GET',f'/api/user/{quote(username,safe="")}')
+        return self._get_with_auth_retry(f'/api/user/{quote(username,safe="")}')
 
 
     @staticmethod
@@ -148,20 +165,25 @@ class MarzbanClient(PasarGuardClient):
         try:
             result=self._post_with_auth_retry('/api/user',payload)
         except (requests.Timeout,requests.ConnectionError) as exc:
-            try:result=self._request('GET',f'/api/user/{quote(username,safe="")}')
+            try:result=self._get_with_auth_retry(f'/api/user/{quote(username,safe="")}')
             except Exception as check:raise PasarGuardError('نتیجه ساخت اکانت Marzban نامشخص است؛ بررسی دستی لازم است.',True) from check
         sub=self._sub(result)
         if not sub:
-            try:sub=self._sub(self._request('GET',f'/api/user/{quote(username,safe="")}'))
+            try:sub=self._sub(self._get_with_auth_retry(f'/api/user/{quote(username,safe="")}'))
             except Exception:pass
         if not sub:raise PasarGuardError('لینک اشتراک از Marzban دریافت نشد؛ وضعیت اکانت را بررسی کنید.',True)
         return result,sub
 
 class MarzneshinClient(PasarGuardClient):
     """Secondary adapter for Marzneshin; group_ids are interpreted as service_ids."""
+    def subscription_url(self, data, username=None):
+        sub = self._sub(data)
+        if not sub and data.get('key') and username:
+            sub = f"{self.url}/sub/{quote(str(username), safe='')}/{quote(str(data['key']), safe='')}"
+        return sub
+
     def get_user(self,username):
-        self.ensure_login()
-        return self._request('GET',f'/api/users/{quote(username,safe="")}')
+        return self._get_with_auth_retry(f'/api/users/{quote(username,safe="")}')
 
     def login(self):
         data=self._request('POST','/api/admins/token',data={'username':self.username,'password':self.password},headers={'Content-Type':'application/x-www-form-urlencoded'})
@@ -176,13 +198,13 @@ class MarzneshinClient(PasarGuardClient):
                  'service_ids':group_ids or [1],'expire_strategy':'fixed_date'}
         try:result=self._post_with_auth_retry('/api/users',payload)
         except (requests.Timeout,requests.ConnectionError) as exc:
-            try:result=self._request('GET',f'/api/users/{quote(username,safe="")}')
+            try:result=self._get_with_auth_retry(f'/api/users/{quote(username,safe="")}')
             except Exception as check:raise PasarGuardError('نتیجه ساخت اکانت Marzneshin نامشخص است؛ بررسی دستی لازم است.',True) from check
-        sub=self._sub(result)
+        sub=self.subscription_url(result,username)
         if not sub and result.get('key'):sub=f"{self.url}/sub/{username}/{result['key']}"
         if not sub:
             try:
-                detail=self._request('GET',f'/api/users/{quote(username,safe="")}');sub=self._sub(detail)
+                detail=self._get_with_auth_retry(f'/api/users/{quote(username,safe="")}');sub=self.subscription_url(detail,username)
                 if not sub and detail.get('key'):sub=f"{self.url}/sub/{username}/{detail['key']}"
             except Exception:pass
         if not sub:raise PasarGuardError('لینک اشتراک از Marzneshin دریافت نشد؛ وضعیت اکانت را بررسی کنید.',True)

@@ -66,6 +66,8 @@ def main():
     elif x.cmd in {'start','stop','restart','service-install','service-remove'}:
         if x.cmd=='service-install':run(['systemctl','daemon-reload']);run(['systemctl','enable','--now','sonarx']);run(['systemctl','enable','--now','sonarx-maintenance.timer'])
         elif x.cmd=='service-remove':
+            run(['systemctl','stop','sonarx-maintenance.timer'],check=False)
+            run(['systemctl','stop','sonarx-maintenance.service'],check=False)
             run(['systemctl','disable','--now','sonarx'],check=False)
             run(['systemctl','disable','--now','sonarx-maintenance.timer'],check=False)
             for unit in ('sonarx.service','sonarx-maintenance.service','sonarx-maintenance.timer'):
@@ -76,6 +78,8 @@ def main():
     elif x.cmd=='update':
         if not (ROOT/'.git').exists():raise SystemExit('No Git checkout at /opt/sonarx')
         old= subprocess.check_output(['git','-C',str(ROOT),'rev-parse','HEAD'],text=True).strip()
+        run(['systemctl','stop','sonarx-maintenance.timer'],check=False)
+        run(['systemctl','stop','sonarx-maintenance.service'],check=False)
         run(['systemctl','stop','sonarx'],check=False)
         try:
             backup_dir=Path('/var/backups/sonarx');backup_dir.mkdir(parents=True,exist_ok=True);os.chmod(backup_dir,0o700)
@@ -97,6 +101,7 @@ def main():
             raise
         finally:
             run(['systemctl','restart','sonarx'],check=False)
+            run(['systemctl','enable','--now','sonarx-maintenance.timer'],check=False)
     elif x.cmd=='recover-orders':
         d=database()
         from .workers.order_recovery import recover_stale_orders

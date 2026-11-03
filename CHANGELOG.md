@@ -6,6 +6,16 @@
 - Requires explicit confirmation when an existing PostgreSQL database is found without recoverable configuration.
 - Removes bot token and PostgreSQL password from installer command-line process arguments where feasible.
 - Adds installer regression tests and GitHub CI checks for the visible template.
+- Applies membership, phone-verification and maintenance gates centrally to customer callbacks and stateful messages; `/start` now checks channel membership before showing the dashboard.
+- Makes blocked-user lookup fail closed when the database check fails.
+- Snapshots plan quota and duration on each order, preventing product edits or shared trial-plan updates from changing an in-flight order.
+- Associates discount reservations with orders and releases them exactly once when an order is refunded; successful/reconciled orders retain the redeemed usage.
+- Stops the maintenance timer and worker during install/update/remove operations to avoid code or migration races.
+- Fixes review reconciliation for explicit unlimited expiries, missing panel fields and Marzneshin key-based subscription links.
+- Validates panel group IDs before order creation, rechecks unlimited trial eligibility at runtime, and normalizes boolean/numeric panel status values.
+- Distinguishes authentication-token failures from uncertain user-creation responses.
+- Reuses one authenticated panel client per server during service synchronization, refreshes expired GET tokens, and rejects malformed expiry values without clearing valid local data.
+- Gives the maintenance worker an explicit systemd runtime limit policy for large service batches.
 
 # SonarX — Changelog
 

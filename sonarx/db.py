@@ -82,7 +82,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,username TEXT,first_name TEXT,balance INTEGER NOT NULL DEFAULT 0 CHECK(balance>=0),is_blocked INTEGER NOT NULL DEFAULT 0,phone TEXT,phone_verified INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS servers(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE,url TEXT NOT NULL,username TEXT NOT NULL,password_enc TEXT NOT NULL,panel_type TEXT NOT NULL DEFAULT 'pasarguard',active INTEGER NOT NULL DEFAULT 1,priority INTEGER NOT NULL DEFAULT 100,created_at TEXT NOT NULL DEFAULT '');
                 CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,description TEXT DEFAULT '',price INTEGER NOT NULL CHECK(price>=0),traffic_gb INTEGER NOT NULL CHECK(traffic_gb>=0),days INTEGER NOT NULL CHECK(days>=0),group_ids TEXT DEFAULT '[]',active INTEGER NOT NULL DEFAULT 1,sort_order INTEGER NOT NULL DEFAULT 100,category_id INTEGER,is_trial INTEGER NOT NULL DEFAULT 0,is_custom INTEGER NOT NULL DEFAULT 0,custom_owner_id INTEGER);
-                CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY,user_id INTEGER NOT NULL,product_id INTEGER NOT NULL,amount INTEGER NOT NULL,status TEXT NOT NULL,server_id INTEGER,remote_username TEXT,subscription_url TEXT,error TEXT,created_at TEXT NOT NULL,FOREIGN KEY(user_id) REFERENCES users(id));
+                CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY,user_id INTEGER NOT NULL,product_id INTEGER NOT NULL,amount INTEGER NOT NULL,status TEXT NOT NULL,server_id INTEGER,remote_username TEXT,subscription_url TEXT,error TEXT,created_at TEXT NOT NULL,traffic_gb INTEGER,days INTEGER,discount_code TEXT,FOREIGN KEY(user_id) REFERENCES users(id));
                 CREATE TABLE IF NOT EXISTS services(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,order_id TEXT UNIQUE NOT NULL,product_id INTEGER NOT NULL,server_id INTEGER NOT NULL,remote_username TEXT NOT NULL,subscription_url TEXT,data_limit_bytes INTEGER NOT NULL DEFAULT 0,used_bytes INTEGER NOT NULL DEFAULT 0,expires_at TEXT,status TEXT NOT NULL DEFAULT 'active',created_at TEXT NOT NULL,FOREIGN KEY(user_id) REFERENCES users(id));
                 CREATE TABLE IF NOT EXISTS deposits(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,amount INTEGER NOT NULL CHECK(amount>0),receipt_id TEXT NOT NULL UNIQUE,status TEXT NOT NULL DEFAULT 'pending',created_at TEXT NOT NULL,reviewed_at TEXT,reviewed_by INTEGER);
                 CREATE TABLE IF NOT EXISTS ledger(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,amount INTEGER NOT NULL,kind TEXT NOT NULL,ref TEXT NOT NULL UNIQUE,created_at TEXT NOT NULL);
@@ -115,6 +115,7 @@ class Database:
                     'servers': {'panel_type':"TEXT NOT NULL DEFAULT 'pasarguard'",'priority':'INTEGER NOT NULL DEFAULT 100','created_at':"TEXT NOT NULL DEFAULT ''"},
                     'products': {'active':'INTEGER NOT NULL DEFAULT 1','sort_order':'INTEGER NOT NULL DEFAULT 100','category_id':'INTEGER','is_trial':'INTEGER NOT NULL DEFAULT 0','is_custom':'INTEGER NOT NULL DEFAULT 0','custom_owner_id':'INTEGER'},
                     'deposits': {'reviewed_at':'TEXT','reviewed_by':'INTEGER'},
+                    'orders': {'traffic_gb':'INTEGER','days':'INTEGER','discount_code':'TEXT'},
                     'settings': {'updated_at':"TEXT NOT NULL DEFAULT ''"},
                 }
                 for table, additions in upgrades.items():
@@ -212,7 +213,7 @@ class Database:
                     c.execute('UPDATE users SET balance=balance+? WHERE id=?',(cashback,d['user_id']))
                     c.execute('INSERT INTO ledger(user_id,amount,kind,ref,created_at) VALUES(?,?,?,?,?)',(d['user_id'],cashback,'cashback',f'cashback:deposit:{did}',now()))
             return dict(d)
-    def begin_order(self,uid,p):
+    def begin_order(self,uid,p,discount_code=None):
         oid=str(uuid.uuid4())
         with self.tx() as c:
             lock=' FOR UPDATE' if self.backend=='postgresql' else ''
@@ -224,7 +225,7 @@ class Database:
             if u['balance']<p['price']: raise ValueError('موجودی کیف پول کافی نیست.')
             c.execute('UPDATE users SET balance=balance-? WHERE id=?',(p['price'],uid))
             c.execute('INSERT INTO ledger(user_id,amount,kind,ref,created_at) VALUES(?,?,?,?,?)',(uid,-p['price'],'purchase',f'order:{oid}',now()))
-            c.execute('INSERT INTO orders(id,user_id,product_id,amount,status,created_at) VALUES(?,?,?,?,?,?)',(oid,uid,p['id'],p['price'],'processing',now()))
+            c.execute('INSERT INTO orders(id,user_id,product_id,amount,status,created_at,traffic_gb,days,discount_code) VALUES(?,?,?,?,?,?,?,?,?)',(oid,uid,p['id'],p['price'],'processing',now(),int(p.get('traffic_gb') or 0),int(p.get('days') or 0),str(discount_code).upper() if discount_code else None))
         return oid
     def begin_trial_order(self,uid,product,max_per_user=1):
         oid=str(uuid.uuid4())
@@ -237,18 +238,18 @@ class Database:
             if int(used)>=max(1,int(max_per_user)): raise ValueError('سهمیه اکانت تست شما به پایان رسیده است.')
             active=c.execute("SELECT id FROM orders WHERE user_id=? AND status IN ('processing','review') LIMIT 1"+lock,(uid,)).fetchone()
             if active: raise ValueError('یک سفارش در حال پردازش یا بررسی دارید.')
-            c.execute('INSERT INTO orders(id,user_id,product_id,amount,status,created_at) VALUES(?,?,?,?,?,?)',(oid,uid,product['id'],0,'processing',now()))
+            c.execute('INSERT INTO orders(id,user_id,product_id,amount,status,created_at,traffic_gb,days) VALUES(?,?,?,?,?,?,?,?)',(oid,uid,product['id'],0,'processing',now(),int(product.get('traffic_gb') or 0),int(product.get('days') or 0)))
         return oid
 
     def finish_order(self,oid,server_id,username,sub,cashback_percent=0,referral_percent=0):
         with self.tx() as c:
-            q='SELECT o.*,p.traffic_gb,p.days FROM orders o JOIN products p ON p.id=o.product_id WHERE o.id=? AND o.status=\'processing\''+(' FOR UPDATE' if self.backend=='postgresql' else '')
+            q='SELECT o.*,COALESCE(o.traffic_gb,p.traffic_gb) AS order_traffic_gb,COALESCE(o.days,p.days) AS order_days FROM orders o JOIN products p ON p.id=o.product_id WHERE o.id=? AND o.status=\'processing\''+(' FOR UPDATE' if self.backend=='postgresql' else '')
             o=c.execute(q,(oid,)).fetchone()
             if not o: raise ValueError('سفارش در وضعیت پردازش نیست.')
-            exp=(datetime.now(timezone.utc)+timedelta(days=o['days'])).isoformat() if o['days'] else None
+            exp=(datetime.now(timezone.utc)+timedelta(days=o['order_days'])).isoformat() if o['order_days'] else None
             changed=c.execute("UPDATE orders SET status='completed',server_id=?,remote_username=?,subscription_url=? WHERE id=? AND status='processing'",(server_id,username,sub,oid)).rowcount
             if changed!=1: raise ValueError('سفارش هم‌زمان تغییر کرده است.')
-            c.execute('INSERT INTO services(user_id,order_id,product_id,server_id,remote_username,subscription_url,data_limit_bytes,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(o['user_id'],oid,o['product_id'],server_id,username,sub,int(o['traffic_gb'])*1024**3,exp,now()))
+            c.execute('INSERT INTO services(user_id,order_id,product_id,server_id,remote_username,subscription_url,data_limit_bytes,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(o['user_id'],oid,o['product_id'],server_id,username,sub,int(o['order_traffic_gb'])*1024**3,exp,now()))
             cashback=int(int(o['amount'])*max(0,min(100,int(cashback_percent or 0)))/100)
             if cashback>0:
                 c.execute('UPDATE users SET balance=balance+? WHERE id=?',(cashback,o['user_id']))
@@ -262,14 +263,38 @@ class Database:
                 if commission>0:
                     c.execute('UPDATE users SET balance=balance+? WHERE id=?',(commission,inviter))
                     c.execute('INSERT INTO ledger(user_id,amount,kind,ref,created_at) VALUES(?,?,?,?,?)',(inviter,commission,'reseller_commission' if reseller and reseller['active'] else 'referral_commission',f'commission:order:{oid}',now()))
-    def fail_order_refund(self,oid,error):
+    def _release_order_discount(self, connection, code):
+        if not code:
+            return
+        sql = (
+            "UPDATE discount_codes SET used_count=GREATEST(0,used_count-1) WHERE code=?"
+            if self.backend == "postgresql"
+            else "UPDATE discount_codes SET used_count=MAX(0,used_count-1) WHERE code=?"
+        )
+        connection.execute(sql, (str(code).upper(),))
+
+    def fail_order_refund(self,oid,error,allow_review=False):
         with self.tx() as c:
             q='SELECT * FROM orders WHERE id=?'+(' FOR UPDATE' if self.backend=='postgresql' else '')
             o=c.execute(q,(oid,)).fetchone()
-            if not o or o['status']!='processing': return False
-            c.execute("UPDATE orders SET status='failed',error=? WHERE id=? AND status='processing'",(str(error)[:1000],oid))
+            if not o: return False
+            allowed_status = o['status'] == 'processing' or (
+                o['status'] == 'review' and (
+                    (o['server_id'] is None and o['remote_username'] is None) or allow_review
+                )
+            )
+            if not allowed_status:
+                return False
+            changed = c.execute(
+                "UPDATE orders SET status='failed',error=? WHERE id=? AND status=?",
+                (str(error)[:1000],oid,o['status'])
+            ).rowcount
+            if changed != 1:
+                return False
             c.execute('UPDATE users SET balance=balance+? WHERE id=?',(o['amount'],o['user_id']))
-            c.execute('INSERT INTO ledger(user_id,amount,kind,ref,created_at) VALUES(?,?,?,?,?)',(o['user_id'],o['amount'],'refund',f'refund:{oid}',now())); return True
+            c.execute('INSERT INTO ledger(user_id,amount,kind,ref,created_at) VALUES(?,?,?,?,?)',(o['user_id'],o['amount'],'refund',f'refund:{oid}',now()))
+            self._release_order_discount(c, o['discount_code'])
+            return True
     def set_order_panel_target(self,oid,server_id,remote_username):
         """Persist the idempotent remote lookup key before issuing the panel create request."""
         with self.tx() as c:
@@ -285,7 +310,7 @@ class Database:
                 (str(error)[:1000],server_id,remote_username,oid)
             ).rowcount==1
 
-    def complete_review_order(self,oid,subscription_url,data_limit_bytes=None,expires_at=None,cashback_percent=0,referral_percent=0):
+    def complete_review_order(self,oid,subscription_url,data_limit_bytes=None,expires_at=UNSET,cashback_percent=0,referral_percent=0):
         """Attach an already-created remote account to a review order without creating it again."""
         if not subscription_url:
             raise ValueError("subscription_url is required")
@@ -297,13 +322,17 @@ class Database:
             existing=c.execute("SELECT id FROM services WHERE order_id=?",(oid,)).fetchone()
             if existing:
                 return False
-            product=c.execute("SELECT traffic_gb,days FROM products WHERE id=?",(order["product_id"],)).fetchone()
+            product=c.execute(
+                "SELECT COALESCE(o.traffic_gb,p.traffic_gb) AS traffic_gb,COALESCE(o.days,p.days) AS days "
+                "FROM orders o JOIN products p ON p.id=o.product_id WHERE o.id=?",
+                (oid,)
+            ).fetchone()
             if not product:
                 return False
             limit=int(data_limit_bytes if data_limit_bytes is not None else (int(product["traffic_gb"] or 0)*1024**3))
             expiry=expires_at
-            if expiry is None and product["days"]:
-                expiry=(datetime.now(timezone.utc)+timedelta(days=int(product["days"]))).isoformat()
+            if expiry is UNSET:
+                expiry=(datetime.now(timezone.utc)+timedelta(days=int(product["days"]))).isoformat() if product["days"] else None
             changed=c.execute("UPDATE orders SET status='completed',subscription_url=?,error=NULL WHERE id=? AND status='review'",(subscription_url,oid)).rowcount
             if changed!=1:
                 return False
@@ -346,9 +375,12 @@ class Database:
             q="SELECT * FROM orders WHERE id=? AND status='review'"+(' FOR UPDATE' if self.backend=='postgresql' else '')
             o=c.execute(q,(oid,)).fetchone()
             if not o:return None
-            c.execute("UPDATE orders SET status='refunded' WHERE id=? AND status='review'",(oid,))
+            changed=c.execute("UPDATE orders SET status='refunded' WHERE id=? AND status='review'",(oid,)).rowcount
+            if changed != 1:
+                return None
             c.execute('UPDATE users SET balance=balance+? WHERE id=?',(o['amount'],o['user_id']))
             c.execute('INSERT INTO ledger(user_id,amount,kind,ref,created_at) VALUES(?,?,?,?,?)',(o['user_id'],o['amount'],'manual_refund',f'review-refund:{oid}',now()))
+            self._release_order_discount(c, o['discount_code'])
             return dict(o)
     def orders_for(self,uid):
         with self.tx() as c: return [dict(r) for r in c.execute('SELECT o.*,p.name product_name FROM orders o JOIN products p ON p.id=o.product_id WHERE o.user_id=? ORDER BY o.created_at DESC LIMIT 30',(uid,)).fetchall()]
@@ -615,11 +647,13 @@ class Database:
         with self.tx() as c:
             r=c.execute("SELECT s.*,v.url,v.username panel_username,v.password_enc,v.panel_type,v.active server_active,v.name server_name FROM services s JOIN servers v ON v.id=s.server_id WHERE s.id=? AND s.user_id=?",(service_id,uid)).fetchone()
             return dict(r) if r else None
-    def update_service_entitlements(self,service_id,uid,data_limit_bytes=None,expires_at=None):
+    def update_service_entitlements(self,service_id,uid,data_limit_bytes=None,expires_at=None,status=UNSET):
         with self.tx() as c:
             fields=[];params=[]
             if data_limit_bytes is not None: fields.append("data_limit_bytes=?");params.append(int(data_limit_bytes))
             if expires_at is not None: fields.append("expires_at=?");params.append(expires_at)
+            if status is not UNSET and status is not None:
+                fields.append("status=?");params.append(str(status))
             if not fields:return False
             params.extend([service_id,uid])
             return c.execute("UPDATE services SET "+",".join(fields)+" WHERE id=? AND user_id=?",(tuple(params))).rowcount==1

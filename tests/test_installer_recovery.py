@@ -62,6 +62,20 @@ class InstallerRecoveryTests(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertIn("original .env is missing",result.stdout)
 
+    def test_updates_quiesce_the_maintenance_timer_and_worker(self):
+        source=SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("systemctl stop sonarx-maintenance.timer",source)
+        self.assertIn("systemctl stop sonarx-maintenance.service",source)
+        maintenance_unit=(SCRIPT.parents[0]/"systemd"/"sonarx-maintenance.service").read_text(encoding="utf-8")
+        self.assertIn("TimeoutStartSec=0",maintenance_unit)
+        self.assertIn("TimeoutStopSec=30",maintenance_unit)
+        update=source.split("update_app(){",1)[1].split("remove_app(){",1)[0]
+        self.assertIn("stop_app_services",update)
+        self.assertIn("start_app_services",update)
+        cli=(SCRIPT.parents[0]/"sonarx"/"cli.py").read_text(encoding="utf-8")
+        self.assertIn("systemctl','stop','sonarx-maintenance.timer",cli)
+        self.assertIn("systemctl','stop','sonarx-maintenance.service",cli)
+
     def test_secret_configuration_update_via_stdin(self):
         (self.app/".env").write_text("BOT_TOKEN=replace_me\n")
         result=self.bash('set_env BOT_TOKEN "123456:private_new_token"')

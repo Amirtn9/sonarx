@@ -2,7 +2,7 @@ import os, tempfile, unittest
 from datetime import datetime, timedelta, timezone
 from sonarx.db import Database, PgConn
 from sonarx.workers.order_recovery import recover_stale_orders
-from sonarx.workers.service_sync import sync_services
+from sonarx.workers.service_sync import sync_services, _status
 
 
 class FakeCursor:
@@ -55,6 +55,7 @@ class WizWizParityTests(unittest.TestCase):
         self.assertTrue(self.db.complete_review_order(oid, "https://sub.invalid/u", 10 * 1024**3, None))
         self.assertFalse(self.db.complete_review_order(oid, "https://sub.invalid/u", 10 * 1024**3, None))
         self.assertEqual(len(self.db.services_for(501)), 1)
+        self.assertIsNone(self.db.services_for(501)[0]["expires_at"])
         self.assertEqual(self.db.orders_for(501)[0]["status"], "completed")
 
     def test_stale_processing_orders_move_to_review(self):
@@ -72,6 +73,58 @@ class WizWizParityTests(unittest.TestCase):
         self.assertEqual(recovered["id"], oid)
         self.assertEqual(recovered["server_id"], server["id"])
         self.assertEqual(recovered["remote_username"], "recovery-user")
+
+    def test_service_sync_reuses_one_authenticated_client_per_server(self):
+        class FakeDB:
+            def __init__(self):
+                self.rows=[
+                    {"id":1,"server_id":7,"server_active":1,"panel_type":"pasarguard","url":"https://panel",
+                     "panel_username":"admin","remote_username":"one","user_id":501,"used_bytes":0,
+                     "data_limit_bytes":100,"expires_at":None},
+                    {"id":2,"server_id":7,"server_active":1,"panel_type":"pasarguard","url":"https://panel",
+                     "panel_username":"admin","remote_username":"two","user_id":502,"used_bytes":0,
+                     "data_limit_bytes":100,"expires_at":None},
+                ]
+                self.updated=[]
+            def services_for_sync(self,limit=500): return self.rows
+            def update_service_snapshot(self,*args,**kwargs):
+                self.updated.append(args[0])
+                return True
+        class Client:
+            def __init__(self): self.users=[]
+            def get_user(self,username):
+                self.users.append(username)
+                return {"used_traffic":0,"data_limit":100,"status":"active"}
+            def subscription_url(self,remote,username): return None
+        db=FakeDB(); created=[]
+        def factory(row,box):
+            client=Client();created.append(client);return client
+        report=sync_services(db,None,client_factory=factory)
+        self.assertEqual(report["updated"],2)
+        self.assertEqual(len(created),1)
+        self.assertEqual(created[0].users,["one","two"])
+
+    def test_service_sync_rejects_invalid_expiry_without_overwriting_snapshot(self):
+        class FakeDB:
+            def __init__(self):
+                self.row={"id":3,"server_id":9,"server_active":1,"panel_type":"pasarguard","url":"https://panel",
+                          "panel_username":"admin","remote_username":"broken","user_id":501,"used_bytes":10,
+                          "data_limit_bytes":100,"expires_at":"2030-01-01T00:00:00+00:00"}
+                self.updated=False
+            def services_for_sync(self,limit=500): return [self.row]
+            def update_service_snapshot(self,*args,**kwargs):
+                self.updated=True
+                return True
+        class Client:
+            def get_user(self,username):
+                return {"used_traffic":0,"data_limit":100,"expire":"not-a-date"}
+            def subscription_url(self,remote,username): return None
+        db=FakeDB()
+        report=sync_services(db,None,client_factory=lambda row,box:Client())
+        self.assertEqual(report["failed"],1)
+        self.assertEqual(report["updated"],0)
+        self.assertFalse(db.updated)
+        self.assertEqual(db.row["expires_at"],"2030-01-01T00:00:00+00:00")
 
     def test_service_sync_preserves_expiry_when_panel_omits_expiry_field(self):
         self.db.add_credit(501, 2000, "seed-sync-missing-expiry")
@@ -94,6 +147,11 @@ class WizWizParityTests(unittest.TestCase):
         self.assertEqual(report["updated"], 1)
         after = self.db.services_for(501)[0]["expires_at"]
         self.assertEqual(after, before)
+
+    def test_service_sync_treats_integer_and_string_false_as_disabled(self):
+        self.assertEqual(_status({"enabled": 0}, None, 0, 0), "disabled")
+        self.assertEqual(_status({"enabled": "false"}, None, 0, 0), "disabled")
+        self.assertEqual(_status({"enabled": 1}, None, 0, 0), "active")
 
     def test_service_sync_updates_usage_and_expiry(self):
         self.db.add_credit(501, 2000, "seed-sync")

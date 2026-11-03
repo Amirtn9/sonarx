@@ -10,7 +10,7 @@ SonarX/
 ├── README_FA.md                 # راهنمای فارسی
 ├── PROJECT_MAP.md               # نقشه معماری و مسیر فایل‌ها
 ├── SITEMAP.md                   # نقشه ناوبری مستندات و ماژول‌ها
-├── BUGFIX_AUDIT_FA.md            # گزارش ممیزی و اصلاحات نسخه 6.3.1
+├── BUGFIX_AUDIT_FA.md            # گزارش ممیزی و اصلاحات نسخه 6.3.2
 ├── docs/
 │   ├── README_FA.md             # فهرست مستندات
 │   ├── WIZWIZ_PARITY_FA.md      # تطبیق قابلیت‌ها با مرجع WizWiz

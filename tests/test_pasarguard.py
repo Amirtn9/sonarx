@@ -40,6 +40,30 @@ class FakeMarzneshin(MarzneshinClient):
 
 
 class PasarGuardTests(unittest.TestCase):
+    def test_get_user_refreshes_expired_token_once(self):
+        class ExpiredGetClient(PasarGuardClient):
+            def __init__(self):
+                super().__init__("https://panel.test","admin","secret")
+                self._token="expired"
+                self.calls=[]
+            def login(self):
+                self.calls.append(("LOGIN","/api/admin/token"))
+                self._token="fresh"
+                return True
+            def _request(self,method,path,**kwargs):
+                self.calls.append((method,path))
+                if method=="GET" and len([call for call in self.calls if call[0]=="GET"])==1:
+                    raise PasarGuardError("API 401: expired token")
+                return {"username":"existing","status":"active"}
+        client=ExpiredGetClient()
+        user=client.get_user("existing")
+        self.assertEqual(user["username"],"existing")
+        self.assertEqual(client.calls,[
+            ("GET","/api/user/existing"),
+            ("LOGIN","/api/admin/token"),
+            ("GET","/api/user/existing")
+        ])
+
     def test_create_user_payload_and_subscription(self):
         c=FakePanel([{"subscription_url":"https://panel.test/sub/abc"}])
         result,sub=c.create_user("sx_1",10,30,[1,2])
@@ -61,6 +85,11 @@ class PasarGuardTests(unittest.TestCase):
             ("POST","/api/user"),("POST","/api/admin/token"),("POST","/api/user")
         ])
 
+    def test_marzneshin_reconstructs_subscription_url_for_existing_user(self):
+        c=FakeMarzneshin([])
+        url=c.subscription_url({"key":"private/key"}, "user/name")
+        self.assertEqual(url,"https://panel.test/sub/user%2Fname/private%2Fkey")
+
     def test_marzneshin_create_refreshes_expired_token_once(self):
         c=FakeMarzneshin([
             PasarGuardError("Marzneshin API 401: expired token"),
@@ -73,6 +102,22 @@ class PasarGuardTests(unittest.TestCase):
         self.assertEqual([call[0:2] for call in c.calls],[
             ("POST","/api/users"),("POST","/api/admins/token"),("POST","/api/users")
         ])
+
+    def test_login_post_failure_is_not_misclassified_as_uncertain_user_creation(self):
+        class BadResponse:
+            status_code=500
+            content=b"not-json"
+            text="internal error"
+            def json(self): raise ValueError("invalid json")
+        c=PasarGuardClient("https://panel.test","admin","secret")
+        with patch.object(c.session,"request",return_value=BadResponse()):
+            with self.assertRaises(PasarGuardError) as ctx:
+                c._request("POST","/api/admin/token")
+        self.assertFalse(ctx.exception.uncertain)
+        with patch.object(c.session,"request",return_value=BadResponse()):
+            with self.assertRaises(PasarGuardError) as ctx:
+                c._request("POST","/api/user",json={})
+        self.assertTrue(ctx.exception.uncertain)
 
     def test_timeout_reconciles_existing_user(self):
         c=FakePanel([requests.Timeout("write timeout"),{"subscription_url":"https://panel.test/sub/existing"}])

@@ -1,6 +1,8 @@
 import os
 import tempfile
 import unittest
+import ast
+from pathlib import Path
 
 from sonarx.db import Database
 
@@ -85,6 +87,13 @@ class MirzaParityCoreTests(unittest.TestCase):
         self.assertEqual(refreshed["data_limit_bytes"],8*1024**3)
         self.assertEqual(refreshed["status"],"limited")
 
+    def test_new_alembic_revision_fits_default_version_column(self):
+        migration=Path(__file__).resolve().parents[1]/"migrations"/"versions"/"0004_order_snapshots_and_discount_reservations.py"
+        tree=ast.parse(migration.read_text(encoding="utf-8"))
+        revision=next(ast.literal_eval(node.value) for node in tree.body
+                      if isinstance(node,ast.Assign) and any(isinstance(target,ast.Name) and target.id=="revision" for target in node.targets))
+        self.assertLessEqual(len(revision),32)
+
     def test_upgrade_adds_new_columns_to_existing_sqlite_schema(self):
         import sqlite3
         legacy_path=os.path.join(self.tmp.name,"legacy.sqlite3")
@@ -93,6 +102,7 @@ class MirzaParityCoreTests(unittest.TestCase):
             conn.executescript("""
                 CREATE TABLE users(id INTEGER PRIMARY KEY,username TEXT,first_name TEXT,balance INTEGER NOT NULL DEFAULT 0,is_blocked INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
                 CREATE TABLE products(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,description TEXT DEFAULT '',price INTEGER NOT NULL,traffic_gb INTEGER NOT NULL,days INTEGER NOT NULL,group_ids TEXT DEFAULT '[]',active INTEGER NOT NULL DEFAULT 1,sort_order INTEGER NOT NULL DEFAULT 100);
+                CREATE TABLE orders(id TEXT PRIMARY KEY,user_id INTEGER NOT NULL,product_id INTEGER NOT NULL,amount INTEGER NOT NULL,status TEXT NOT NULL,server_id INTEGER,remote_username TEXT,subscription_url TEXT,error TEXT,created_at TEXT NOT NULL);
             """)
         finally:
             conn.close()
@@ -102,6 +112,7 @@ class MirzaParityCoreTests(unittest.TestCase):
         try:
             user_columns={r[1] for r in conn.execute("PRAGMA table_info(users)")}
             product_columns={r[1] for r in conn.execute("PRAGMA table_info(products)")}
+            order_columns={r[1] for r in conn.execute("PRAGMA table_info(orders)")}
         finally:
             conn.close()
         self.assertIn("phone",user_columns)
@@ -109,6 +120,7 @@ class MirzaParityCoreTests(unittest.TestCase):
         self.assertIn("category_id",product_columns)
         self.assertIn("is_trial",product_columns)
         self.assertIn("custom_owner_id",product_columns)
+        self.assertTrue({"traffic_gb","days","discount_code"}.issubset(order_columns))
 
     def test_wheel_spin_cooldown_and_reward_once(self):
         spin=self.db.claim_wheel_spin(1101,24)

@@ -39,6 +39,18 @@ from dotenv import dotenv_values
 print(dotenv_values(sys.argv[1]).get(sys.argv[2]) or "")
 PY
 }
+stop_app_services(){
+  # Prevent a timer-triggered worker from importing code or migrating data
+  # while the checkout and virtualenv are being changed.
+  systemctl stop sonarx-maintenance.timer || true
+  systemctl stop sonarx-maintenance.service || true
+  systemctl stop "$SERVICE" || true
+}
+start_app_services(){
+  systemctl daemon-reload
+  systemctl enable --now "$SERVICE"
+  systemctl enable --now sonarx-maintenance.timer
+}
 install_deps(){
   info "Installing system dependencies and PostgreSQL 16..."
   apt-get update
@@ -53,7 +65,7 @@ fetch_source(){
     git -C "$APP_DIR" pull --ff-only origin "$BRANCH"
   elif [[ -e "$APP_DIR" ]]; then
     fail "$APP_DIR exists but is not a Git checkout. Preserve it; inspect before replacing."
-    exit 1
+    return 1
   else
     git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
   fi
@@ -212,6 +224,9 @@ PY
 install_app(){
   need_root
   install_deps
+  stop_app_services
+  local restore_services=1
+  trap 'if [[ "${restore_services:-0}" == 1 ]]; then start_app_services || true; fi' ERR
   fetch_source
   cd "$APP_DIR"
   python3 -m venv .venv
@@ -240,9 +255,9 @@ WRAPPER
     fi
   fi
   rm -f .migration-needed
-  systemctl daemon-reload
-  systemctl enable --now "$SERVICE"
-  systemctl enable --now sonarx-maintenance.timer
+  start_app_services
+  restore_services=0
+  trap - ERR
   ok "SonarX installed. Run: sonarx status"
   info "Admin commands: sonarx token-change | sonarx admins-set ID1,ID2 | sonarx logs -n 200 -f"
 }
@@ -252,18 +267,18 @@ update_app(){
   local old_head
   old_head="$(git -C "$APP_DIR" rev-parse HEAD)"
   backup_config
-  systemctl stop "$SERVICE" || true
+  stop_app_services
   mkdir -p /var/backups/sonarx
   chmod 700 /var/backups/sonarx
   if [[ "$(get_env DATABASE_URL)" == postgresql* ]]; then
     if ! /usr/local/bin/sonarx backup --output "/var/backups/sonarx/pre-update-$(date +%Y%m%d-%H%M%S).dump"; then
-      systemctl restart "$SERVICE" || true
+      start_app_services || true
       fail "Pre-update database backup failed; update cancelled."
       return 1
     fi
   elif [[ -n "$(get_env DATABASE_PATH)" && -f "$APP_DIR/$(get_env DATABASE_PATH)" ]]; then
     if ! cp "$APP_DIR/$(get_env DATABASE_PATH)" "/var/backups/sonarx/pre-update-$(date +%Y%m%d-%H%M%S).sqlite3"; then
-      systemctl restart "$SERVICE" || true
+      start_app_services || true
       fail "SQLite backup failed; update cancelled."
       return 1
     fi
@@ -276,12 +291,11 @@ update_app(){
     warn "Update failed; restoring previous source revision."
     git -C "$APP_DIR" reset --hard "$old_head" || true
     (cd "$APP_DIR" && .venv/bin/pip install -r requirements.txt) || true
-    systemctl restart "$SERVICE" || true
+    start_app_services || true
     fail "Update did not complete. Check /var/log/sonarx-install.log and database migration state."
     return 1
   fi
-  systemctl restart "$SERVICE"
-  systemctl enable --now sonarx-maintenance.timer
+  start_app_services
   ok "SonarX updated."
 }
 remove_app(){
@@ -289,7 +303,10 @@ remove_app(){
   warn "Uninstall preserves PostgreSQL and securely backs up .env / Fernet / local data."
   prompt answer "Remove application files? Type REMOVE to confirm: "
   [[ "$answer" == "REMOVE" ]] || { info "Cancelled."; return; }
-  backup_config
+  backup_config || { fail "Configuration backup failed; uninstall cancelled."; return 1; }
+  stop_app_services
+  local restore_services=1
+  trap 'if [[ "${restore_services:-0}" == 1 ]]; then start_app_services || true; fi' ERR
   mkdir -p "$BACKUP_DIR" "$PERSIST_DIR"
   chmod 700 "$BACKUP_DIR" "$PERSIST_DIR"
   if [[ -d "$APP_DIR/data" ]]; then
@@ -298,6 +315,8 @@ remove_app(){
     chmod 700 "$saved_data"
     info "Local database files preserved in $saved_data"
   fi
+  restore_services=0
+  trap - ERR
   systemctl disable --now "$SERVICE" || true
   systemctl disable --now sonarx-maintenance.timer || true
   rm -f /etc/systemd/system/sonarx.service /etc/systemd/system/sonarx-maintenance.service /etc/systemd/system/sonarx-maintenance.timer /usr/local/bin/sonarx

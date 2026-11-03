@@ -33,14 +33,23 @@ def _as_datetime(value: Any):
 def _status(remote: dict, expires_at: str | None, used: int, limit: int) -> str:
     raw = str(remote.get("status") or "").lower()
     enabled = remote.get("enabled")
+    enabled_text = str(enabled).strip().lower() if enabled is not None else ""
+    disabled_flag = enabled_text in {"0", "false", "no", "off"}
     if raw == "expired":
         return "expired"
-    if enabled is False or raw in {"disabled", "inactive", "limited", "on_hold"}:
-        return "disabled" if raw != "limited" else "limited"
+    if disabled_flag or enabled is False or raw in {"disabled", "inactive", "on_hold"}:
+        return "disabled"
+    if raw == "limited":
+        return "limited"
     now = datetime.now(timezone.utc)
     if expires_at:
         try:
-            if datetime.fromisoformat(expires_at).astimezone(timezone.utc) <= now:
+            parsed_expiry = datetime.fromisoformat(expires_at)
+            if parsed_expiry.tzinfo is None:
+                parsed_expiry = parsed_expiry.replace(tzinfo=timezone.utc)
+            elif parsed_expiry.tzinfo is not None:
+                parsed_expiry = parsed_expiry.astimezone(timezone.utc)
+            if parsed_expiry <= now:
                 return "expired"
         except ValueError:
             pass
@@ -56,12 +65,18 @@ def sync_services(db, secret_box, limit: int = 500, client_factory=None, verify_
     factory = client_factory or (lambda row, box: _client(row, box, verify_tls))
     result = {"checked": 0, "updated": 0, "failed": 0, "errors": []}
     rows = db.services_for_sync(limit=limit)
+    clients = {}
     for row in rows:
         result["checked"] += 1
         try:
             if not row.get("server_active"):
                 continue
-            client = factory(row, secret_box)
+            server_key = row.get("server_id")
+            if server_key is None:
+                server_key = (row.get("panel_type"), row.get("url"), row.get("panel_username"))
+            if server_key not in clients:
+                clients[server_key] = factory(row, secret_box)
+            client = clients[server_key]
             remote = client.get_user(row["remote_username"])
             used_value = remote.get("used_traffic")
             if used_value is None:
@@ -86,8 +101,13 @@ def sync_services(db, secret_box, limit: int = 500, client_factory=None, verify_
                     if expiry_key == "expiryTime":
                         raw_expiry = float(raw_expiry) / 1000
                     expiry = _as_datetime(raw_expiry)
+                    if expiry is None:
+                        raise ValueError("panel returned an invalid expiry value")
                 expiry_for_status = expiry
-            sub = client._sub(remote) if hasattr(client, "_sub") else None
+            if hasattr(client, "subscription_url"):
+                sub = client.subscription_url(remote, row["remote_username"])
+            else:
+                sub = client._sub(remote) if hasattr(client, "_sub") else None
             status = _status(remote, expiry_for_status, used, quota)
             ok = db.update_service_snapshot(
                 row["id"], row["user_id"], used_bytes=used, limit_bytes=quota,

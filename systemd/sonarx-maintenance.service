@@ -5,6 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=0
+TimeoutStopSec=30
 User=sonarx
 Group=sonarx
 WorkingDirectory=/opt/sonarx

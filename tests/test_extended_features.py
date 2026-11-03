@@ -52,6 +52,8 @@ class ExtendedFeatureTests(unittest.TestCase):
         updated=self.db.service_for_user(service["id"],1001)
         self.assertEqual(updated["data_limit_bytes"],15*1024**3)
         self.assertEqual(updated["expires_at"],"2030-01-01T00:00:00+00:00")
+        self.assertTrue(self.db.update_service_entitlements(service["id"],1001,status="disabled"))
+        self.assertEqual(self.db.service_for_user(service["id"],1001)["status"],"disabled")
 
     def test_top_customer_rankings(self):
         self.db.add_credit(1001,1000,"deposit-seed","deposit")
@@ -62,5 +64,46 @@ class ExtendedFeatureTests(unittest.TestCase):
     def test_user_search(self):
         self.assertEqual(self.db.search_users("alice")[0]["id"],1001)
         self.assertEqual(self.db.search_users("1002")[0]["id"],1002)
+
+    def test_order_discount_reservation_is_released_after_automatic_refund(self):
+        self.db.add_product("Discounted","test",1000,10,30,"[]")
+        self.db.add_credit(1001,2000,"discount-refund-seed")
+        self.db.add_discount("ORDER20",20,1)
+        self.assertEqual(self.db.reserve_discount("ORDER20"),20)
+        product=self.db.product(1)
+        product["price"]=800
+        oid=self.db.begin_order(1001,product,discount_code="order20")
+        self.assertEqual(self.db.discounts()[0]["used_count"],1)
+        self.assertTrue(self.db.fail_order_refund(oid,"panel unavailable"))
+        self.assertEqual(self.db.discounts()[0]["used_count"],0)
+        self.assertFalse(self.db.fail_order_refund(oid,"duplicate refund"))
+        self.assertEqual(self.db.discounts()[0]["used_count"],0)
+
+    def test_order_discount_reservation_is_released_after_manual_review_refund(self):
+        self.db.add_product("Discounted","test",1000,10,30,"[]")
+        self.db.add_credit(1001,2000,"review-discount-seed")
+        self.db.add_discount("REVIEW20",20,1)
+        self.assertEqual(self.db.reserve_discount("REVIEW20"),20)
+        product=self.db.product(1)
+        product["price"]=800
+        oid=self.db.begin_order(1001,product,discount_code="review20")
+        self.db.mark_order_review(oid,"uncertain")
+        self.assertIsNotNone(self.db.refund_review_order(oid))
+        self.assertEqual(self.db.discounts()[0]["used_count"],0)
+        self.assertIsNone(self.db.refund_review_order(oid))
+        self.assertEqual(self.db.discounts()[0]["used_count"],0)
+
+    def test_successful_order_keeps_discount_usage_consumed(self):
+        self.db.add_product("Discounted","test",1000,10,30,"[]")
+        self.db.add_credit(1001,2000,"success-discount-seed")
+        self.db.add_discount("SUCCESS20",20,1)
+        self.assertEqual(self.db.reserve_discount("SUCCESS20"),20)
+        product=self.db.product(1)
+        product["price"]=800
+        oid=self.db.begin_order(1001,product,discount_code="success20")
+        self.db.add_server("panel","https://panel.test","admin","enc")
+        server=self.db.servers()[0]
+        self.db.finish_order(oid,server["id"],"discount_user","https://panel.test/sub")
+        self.assertEqual(self.db.discounts()[0]["used_count"],1)
 
 if __name__=="__main__":unittest.main()

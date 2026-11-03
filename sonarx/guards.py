@@ -36,9 +36,13 @@ def maintenance_enabled_for_user(uid: int, feature_getter, admin_checker) -> boo
     return bool(enabled) and not bool(admin_checker(uid))
 
 
-def is_blocked_user(user: dict | None, is_admin: bool = False) -> bool:
-    """Blocked users cannot use the bot; an administrator is never locked out."""
-    return bool(user and user.get("is_blocked")) and not bool(is_admin)
+def is_blocked_user(user: dict | None, is_admin: bool = False, lookup_failed: bool = False) -> bool:
+    """Blocked users are denied; admins bypass the guard and lookup failures fail closed."""
+    if is_admin:
+        return False
+    if lookup_failed:
+        return True
+    return bool(user and user.get("is_blocked"))
 
 
 def admin_permission_for_callback(data: str) -> str | None:
