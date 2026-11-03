@@ -1,0 +1,26 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: sonarx
+      POSTGRES_USER: sonarx
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sonarx -d sonarx"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      DATABASE_URL: postgresql+psycopg://sonarx:${POSTGRES_PASSWORD}@db:5432/sonarx
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes: [./logs:/app/logs]
+volumes:
+  postgres_data:

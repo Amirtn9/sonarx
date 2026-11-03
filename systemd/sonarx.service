@@ -1,0 +1,25 @@
+[Unit]
+Description=SonarX Telegram VPN Store Bot
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+[Service]
+Type=simple
+User=sonarx
+Group=sonarx
+WorkingDirectory=/opt/sonarx
+EnvironmentFile=/opt/sonarx/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/opt/sonarx/.venv/bin/alembic upgrade head
+ExecStart=/opt/sonarx/.venv/bin/python -m sonarx.bot
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGINT
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/sonarx/data /opt/sonarx/logs
+[Install]
+WantedBy=multi-user.target

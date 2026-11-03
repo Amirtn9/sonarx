@@ -1,0 +1,29 @@
+import unittest
+from unittest.mock import patch
+import requests
+from sonarx.pasarguard import PasarGuardClient,PasarGuardError
+
+class FakePanel(PasarGuardClient):
+ def __init__(self,steps):super().__init__('https://panel.test','admin','secret');self.steps=list(steps);self.calls=[]
+ def ensure_login(self):self._token='fake'
+ def _request(self,method,path,**kwargs):
+  self.calls.append((method,path,kwargs))
+  value=self.steps.pop(0)
+  if isinstance(value,Exception):raise value
+  return value
+
+class PasarGuardTests(unittest.TestCase):
+ def test_create_user_payload_and_subscription(self):
+  c=FakePanel([{'subscription_url':'https://panel.test/sub/abc'}])
+  result,sub=c.create_user('sx_1',10,30,[1,2])
+  self.assertEqual(sub,'https://panel.test/sub/abc')
+  payload=c.calls[0][2]['json'];self.assertEqual(payload['data_limit'],10*1024**3);self.assertEqual(payload['group_ids'],[1,2])
+ def test_timeout_reconciles_existing_user(self):
+  c=FakePanel([requests.Timeout('write timeout'),{'subscription_url':'https://panel.test/sub/existing'}])
+  _,sub=c.create_user('sx_2',5,7,[])
+  self.assertEqual(sub,'https://panel.test/sub/existing');self.assertEqual(c.calls[1][0:2],('GET','/api/user/sx_2'))
+ def test_uncertain_timeout_is_not_silently_retried(self):
+  c=FakePanel([requests.Timeout('timeout'),requests.ConnectionError('offline')])
+  with self.assertRaises(PasarGuardError) as ctx:c.create_user('sx_3',1,1,[])
+  self.assertTrue(ctx.exception.uncertain);self.assertEqual(len(c.calls),2)
+if __name__=='__main__':unittest.main()
