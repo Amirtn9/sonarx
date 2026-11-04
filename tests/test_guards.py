@@ -101,5 +101,14 @@ class AccessGuardTests(unittest.TestCase):
         self.assertFalse(is_blocked_user(None, False))
 
 
+    def test_blocked_guard_fails_closed_when_database_lookup_raises(self):
+        bot_file = Path(__file__).resolve().parents[1] / "sonarx" / "bot.py"
+        tree = ast.parse(bot_file.read_text(encoding="utf-8"))
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "blocked")
+        handler = next(h for h in node.body if isinstance(h, ast.Try)).handlers[0]
+        returns = [n for n in ast.walk(handler) if isinstance(n, ast.Return)]
+        self.assertTrue(any(ast.unparse(n.value) == "not admin(uid)" for n in returns))
+
+
 if __name__ == "__main__":
     unittest.main()

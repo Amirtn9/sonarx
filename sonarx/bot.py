@@ -75,7 +75,9 @@ def blocked(uid):
         return is_blocked_user(db.get_user(uid), False)
     except Exception:
         log.exception('Could not evaluate blocked-user guard for uid=%s', uid)
-        return False
+        # Fail closed for regular users if the database cannot establish their
+        # account status. Configured owners remain able to recover the service.
+        return not admin(uid)
 
 
 # These guards are deliberately registered before feature handlers. The bot is a
